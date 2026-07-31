@@ -4,31 +4,17 @@ START=50
 USE_PROCD=1
 
 PROG=/usr/bin/mimic
-KMOD_NAME=mimic
 GEN_DIR=/var/run/mimic
 
 . /lib/functions/network.sh
 
-# kfunc build: the BPF program calls kfuncs exported by mimic.ko, so the
-# module is a hard requirement — skip the instance loudly rather than
-# start a doomed mimic that would only churn procd respawn. Normally a
-# no-op safety net: kmod-mimic autoloads at boot (AutoProbe).
-ensure_kmod_loaded() {
-	[ -d "/sys/module/${KMOD_NAME}" ] && return 0
-	modprobe "${KMOD_NAME}" 2>/dev/null && return 0
-	return 1
-}
-
-# render_option <cfg> <key> <out>: emit "key=value" only when the UCI
-# option is set, so mimic's own defaults apply otherwise.
+# Emit "key=value" only when the UCI option is set, so mimic defaults apply.
 render_option() {
 	local val
 	config_get val "${1}" "${2}"
 	[ -n "${val}" ] && echo "${2}=${val}" >> "${3}"
 }
 
-# render_bool <cfg> <key> <out>: same, normalizing UCI bool spellings
-# (1/on/true/yes...) to mimic's true/false.
 render_bool() {
 	local raw val
 	config_get raw "${1}" "${2}"
@@ -45,16 +31,13 @@ render_filter() {
 	echo "filter=${1}" >> "${2}"
 }
 
-# Render a mimic -F config file from the UCI section. The -F parser
-# accepts every run option (link_type, xdp_mode, filter, settings), so
-# the whole instance config lives in one generated file.
+# Render the instance's mimic -F config file from its UCI section.
 render_config() {
 	local cfg="${1}" out="${2}"
 	local key
 
 	mkdir -p "${GEN_DIR}"
 	: > "${out}"
-
 	for key in link_type xdp_mode handshake keepalive padding; do
 		render_option "${cfg}" "${key}" "${out}"
 	done
@@ -77,26 +60,18 @@ start_instance() {
 		return 0
 	}
 
-	# 'interface' is a logical OpenWrt network interface
-	if ! network_get_device dev "${interface}" || [ -z "${dev}" ]; then
-		logger -t mimic "Logical interface '${interface}' not up, skipping (cfg=${cfg})"
-		return 0
-	fi
-
-	if ! ensure_kmod_loaded; then
-		logger -t mimic "Failed to load kernel module '${KMOD_NAME}', not starting instance (cfg=${cfg})"
-		return 1
-	fi
+	# Logical interface -> netdev; if down, the iface trigger starts us later.
+	network_get_device dev "${interface}" && [ -n "${dev}" ] || return 0
 
 	# A hand-written config_file wins; otherwise render one from UCI.
 	config_get config_file "${cfg}" config_file
 	if [ -n "${config_file}" ]; then
-		if [ ! -r "${config_file}" ]; then
-			logger -t mimic "Config '${config_file}' missing or unreadable, skipping (cfg=${cfg})"
+		[ -r "${config_file}" ] || {
+			logger -t mimic "Config '${config_file}' unreadable, skipping (cfg=${cfg})"
 			return 0
-		fi
+		}
 	else
-		config_file="${GEN_DIR}/${cfg}.gen.conf"
+		config_file="${GEN_DIR}/${cfg}.conf"
 		render_config "${cfg}" "${config_file}"
 	fi
 
@@ -113,22 +88,13 @@ start_instance() {
 	procd_close_instance
 }
 
-# Watch each enabled section's logical interface and act on transitions
-# only: start the instance on `interface.up`, stop it on `interface.down`.
-# We deliberately don't subscribe to `interface.update` — mimic binds to a
-# netdev (resolved via network_get_device), not L3 state, so mid-life
-# IP/DNS/route updates would just cause needless stop+start churn.
-#
-# `start <cfg>` is idempotent under procd's "add" semantics: same params
-# is a no-op, changed params (e.g. PPPoE reassigned the netdev) trigger
-# an automatic restart with the new params.
+# Restart/stop each enabled instance on its logical interface's up/down events.
 add_iface_trigger() {
 	local cfg="${1}"
 	local enabled interface
 
 	config_get_bool enabled "${cfg}" enabled 0
 	[ "${enabled}" -eq 1 ] || return 0
-
 	config_get interface "${cfg}" interface
 	[ -n "${interface}" ] || return 0
 
@@ -148,31 +114,25 @@ section_match() {
 	[ "${1}" = "${instance}" ] && instance_found=1
 }
 
-# `service mimic <action> [<name>]` — when <name> is given, only that UCI
-# section is touched. rc_procd uses procd's "add" semantics in that case
-# (won't disturb other instances); without a name it uses "set" (full
-# replace, removed instances stop). procd_kill (default stop) honours the
-# instance arg too.
+# `service mimic <action> [<section>]` acts on a single instance when given.
 start_service() {
 	local instance="${1}"
 
 	config_load mimic
-
 	if [ -n "${instance}" ]; then
 		local instance_found=0
 		config_foreach section_match mimic
-		if [ "${instance_found}" -ne 1 ]; then
+		[ "${instance_found}" -eq 1 ] || {
 			logger -t mimic "Section '${instance}' not found in /etc/config/mimic"
 			return 1
-		fi
+		}
 		start_instance "${instance}"
 	else
 		config_foreach start_instance mimic
 	fi
 }
 
-# Mimic loads its config at startup and has no SIGHUP handler, so reload
-# is implemented as stop+start. The instance arg propagates to both.
+# mimic has no SIGHUP handler; reload is stop+start.
 reload_service() {
 	stop "${@}"
 	start "${@}"
