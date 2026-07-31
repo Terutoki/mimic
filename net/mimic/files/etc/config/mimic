@@ -1,26 +1,14 @@
-# Mimic obfuscates UDP traffic (e.g. WireGuard) as TCP using eBPF.
-#
-# Each `config mimic` section runs one mimic instance against an OpenWrt
-# logical network interface (an entry in /etc/config/network — e.g.
-# 'wan', 'lan', 'vpn'). mimic resolves the logical name to the underlying
-# netdev (e.g. 'wan' on PPPoE → 'pppoe-wan'), attaches its eBPF programs,
-# and is automatically restarted when the interface state changes.
-#
-# To enable: set `enabled '1'`, ensure `interface` matches a section in
-# /etc/config/network, edit the referenced `config_file` with at least
-# one `filter` line, then `service mimic restart`.
-#
-# Optional WireGuard egress kill switch: when `killswitch '1'`, the init
-# script scans the referenced `config_file` for `filter = …` entries and
-# drops the matching unmasked UDP egress, so a stopped or crashed mimic
-# can't leak a bare WG handshake. No separate endpoint list to maintain —
-# the kill switch protects exactly the flows mimic itself is configured
-# to handle. For `local=…` filters the IP is ignored (the source address
-# may be DHCP/PPPoE/SLAAC assigned and not stable) and only the port is
-# matched, covering both IPv4 and IPv6.
-
 config mimic 'wan'
 	option enabled '0'
-	option interface 'wan'
-	option config_file '/etc/mimic/wan.conf'
-	option killswitch '0'
+	option interface 'wan'         # logical network interface
+	list filter 'remote=192.0.2.1:1234'
+	# option anti_gro '1'
+	# option link_type 'none'      # eth|none — 'none' for PPP/TUN (default eth)
+	# option xdp_mode 'skb'        # skb|native (default: native if supported)
+	# option padding 'random'      # bytes or 'random'
+	# option max_window '0'
+	# option handshake '2:4'       # i:r — connection retry behaviour
+	# option keepalive '25:60:3:0' # t:i:r:s
+	# option verbose '0'
+	# option quiet '0'
+	# option config_file '/etc/mimic/wan.conf'  # bypass UCI rendering

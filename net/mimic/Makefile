@@ -5,7 +5,7 @@ include $(INCLUDE_DIR)/version.mk
 
 PKG_NAME := mimic
 PKG_VERSION := 0.7.1
-PKG_RELEASE := 4
+PKG_RELEASE := 5
 
 commit := 5fe6a06ce46771b33f7b835310553e8c549cd1dc
 PKG_BUILD_DIR := $(BUILD_DIR)/mimic-$(commit)
@@ -25,15 +25,36 @@ define Package/mimic
 	CATEGORY := Network
 	TITLE := eBPF TCP -> UDP Obfuscator
 	URL := https://github.com/hack3ric/mimic
-	DEPENDS := +libbpf +libffi +kmod-sched-core +kmod-sched-bpf $(BPF_DEPENDS)
+	DEPENDS := +libbpf +libffi +kmod-sched-core +kmod-sched-bpf +kmod-mimic $(BPF_DEPENDS)
+endef
+
+define Package/mimic/description
+  Mimic is a lightweight eBPF-based tool that obfuscates UDP traffic
+  (e.g. WireGuard) as TCP by transparently rewriting packet headers at
+  TC/XDP hooks. This fork adds the anti_gro setting.
 endef
 
 define KernelPackage/mimic
 	SECTION := net
 	SUBMENU := Network Support
 	TITLE := eBPF TCP -> UDP Obfuscator - Kernel Module
+	DEPENDS := +@KERNEL_BPF_EVENTS +@KERNEL_BPF_JIT +@KERNEL_DEBUG_INFO_BTF +@KERNEL_DEBUG_INFO_BTF_MODULES @!KERNEL_DEBUG_INFO_REDUCED
 	FILES := $(PKG_BUILD_DIR)/kmod/mimic.ko
+	AUTOLOAD := $(call AutoProbe,mimic)
 endef
+
+define KernelPackage/mimic/description
+  Kernel module for Mimic providing the kfunc-based checksum fixup
+  required by the eBPF packet rewriting. Selecting this package enables
+  the kernel BTF/JIT options the kfuncs depend on.
+endef
+
+mimic_compat_flags :=
+ifneq ($(findstring 6.1.,$(LINUX_VERSION)),)
+  mimic_compat_flags := COMPAT_LINUX_6_1=1
+else ifneq ($(findstring 6.6.,$(LINUX_VERSION)),)
+  mimic_compat_flags := COMPAT_LINUX_6_6=1
+endif
 
 mimic_kmod_flags := \
 	KERNEL_DIR="$(LINUX_DIR)" \
@@ -42,25 +63,24 @@ mimic_kmod_flags := \
 	M="$(PKG_BUILD_DIR)/kmod" \
 	V="$(V)" \
 	CHECKSUM_HACK=kfunc \
-	COMPAT_LINUX_6_6=1
+	$(mimic_compat_flags)
 
 mimic_cli_flags := \
-	MODE= \
+	MODE=release \
 	BPF_CC="$(CLANG)" \
 	BPFTOOL="$(STAGING_DIR_HOST)/usr/sbin/bpftool" \
 	BPF_TARGET="$(BPF_TARGET)" \
 	LLVM_STRIP="$(LLVM_STRIP)" \
 	ARGP_STANDALONE=1 \
 	CHECKSUM_HACK=kfunc \
-	COMPAT_LINUX_6_6=1 \
 	RUNTIME_DIR=/var/run/mimic \
-	STRIP_BTF_EXT=1 \
+	$(mimic_compat_flags) \
 	USE_LIBXDP=0
 
 export BPF_CFLAGS := \
 	-I$(BPF_HEADERS_DIR)/user_headers/include \
 	-I$(STAGING_DIR)/usr/include \
-	-D__MIPS$(if $(CONFIG_BIG_ENDIAN),EB,EL)__
+	$(if $(CONFIG_mips)$(CONFIG_mipsel)$(CONFIG_mips64),-D__MIPS$(if $(CONFIG_BIG_ENDIAN),EB,EL)__)
 
 define Build/Compile
 	$(MAKE) -C "$(LINUX_DIR)" $(mimic_kmod_flags) modules
@@ -76,14 +96,10 @@ define Package/mimic/install
 
 	$(INSTALL_DIR) $(1)/etc/config
 	$(INSTALL_CONF) ./files/etc/config/mimic $(1)/etc/config/mimic
-
-	$(INSTALL_DIR) $(1)/etc/mimic
-	$(INSTALL_CONF) ./files/etc/mimic/wan.conf $(1)/etc/mimic/wan.conf
 endef
 
 define Package/mimic/conffiles
 /etc/config/mimic
-/etc/mimic/wan.conf
 endef
 
 define Package/mimic/postinst
