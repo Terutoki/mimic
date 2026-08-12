@@ -27,10 +27,13 @@ jobs:
           ARCH: ${{ matrix.arch }}-${{ matrix.revision }}
           PACKAGES: mimic
           V: s
+      - name: Collect apk packages
+        run: |
+          mkdir -p apk
+          cp bin/packages/*/action/*.apk apk/ 2>/dev/null || true
+          cp bin/targets/*/*/packages/kmod-mimic*.apk apk/ 2>/dev/null || true
       - name: Store packages
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.arch }}-${{ matrix.revision }}
-          path: |
-            bin/packages/*/action/*.apk
-            bin/targets/*/*/packages/kmod-mimic*.apk
+          path: apk/*.apk
