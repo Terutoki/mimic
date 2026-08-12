@@ -1,0 +1,36 @@
+name: ImmortalWrt package build
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build-immortalwrt:
+    name: Build ${{ matrix.revision }} packages for ${{ matrix.arch }}
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        arch:
+          - x86_64
+        revision:
+          - openwrt-25.12
+          - master
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Build
+        uses: openwrt/gh-action-sdk@main
+        env:
+          CONTAINER: immortalwrt/sdk
+          ARCH: ${{ matrix.arch }}-${{ matrix.revision }}
+          PACKAGES: mimic
+          V: s
+      - name: Store packages
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.arch }}-${{ matrix.revision }}
+          path: |
+            bin/packages/*/action/*.apk
+            bin/targets/*/*/packages/kmod-mimic*.apk
