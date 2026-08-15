@@ -25,7 +25,7 @@ define Package/mimic
 	CATEGORY := Network
 	TITLE := eBPF TCP -> UDP Obfuscator
 	URL := https://github.com/hack3ric/mimic
-	DEPENDS := +libbpf +libffi +kmod-sched-core +kmod-sched-bpf
+	DEPENDS := +libbpf +libffi +kmod-sched-core +kmod-sched-bpf +kmod-mimic $(BPF_DEPENDS)
 endef
 
 define Package/mimic/description
@@ -38,13 +38,15 @@ define KernelPackage/mimic
 	SECTION := net
 	SUBMENU := Network Support
 	TITLE := eBPF TCP -> UDP Obfuscator - Kernel Module
+	DEPENDS := +@KERNEL_BPF_EVENTS +@KERNEL_BPF_JIT +@KERNEL_DEBUG_INFO_BTF +@KERNEL_DEBUG_INFO_BTF_MODULES @!KERNEL_DEBUG_INFO_REDUCED
 	FILES := $(PKG_BUILD_DIR)/kmod/mimic.ko
+	AUTOLOAD := $(call AutoProbe,mimic)
 endef
 
 define KernelPackage/mimic/description
-  Kernel module for Mimic providing the kprobe-based checksum fixup
-  for the eBPF packet rewriting. Optional: most NICs do not require
-  checksum hacks, and Mimic works without the kernel module.
+  Kernel module for Mimic providing the kfunc-based checksum fixup
+  required by the eBPF packet rewriting. Selecting this package enables
+  the kernel BTF/JIT options the kfuncs depend on.
 endef
 
 mimic_compat_flags :=
@@ -60,7 +62,7 @@ mimic_kmod_flags := \
 	CROSS_COMPILE="$(TARGET_CROSS)" \
 	M="$(PKG_BUILD_DIR)/kmod" \
 	V="$(V)" \
-	CHECKSUM_HACK=kprobe \
+	CHECKSUM_HACK=kfunc \
 	$(mimic_compat_flags)
 
 mimic_cli_flags := \
@@ -70,7 +72,7 @@ mimic_cli_flags := \
 	BPF_TARGET="$(BPF_TARGET)" \
 	LLVM_STRIP="$(LLVM_STRIP)" \
 	ARGP_STANDALONE=1 \
-	CHECKSUM_HACK=kprobe \
+	CHECKSUM_HACK=kfunc \
 	RUNTIME_DIR=/var/run/mimic \
 	$(mimic_compat_flags) \
 	USE_LIBXDP=0
