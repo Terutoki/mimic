@@ -10,7 +10,7 @@ PKG_RELEASE := 5
 commit := 5fe6a06ce46771b33f7b835310553e8c549cd1dc
 PKG_BUILD_DIR := $(BUILD_DIR)/mimic-$(commit)
 PKG_SOURCE := $(commit).tar.gz
-PKG_SOURCE_URL := https://github.com/tracyhatemice/mimic/archive/
+PKG_SOURCE_URL := https://github.com/Terutoki/mimic/archive/
 PKG_HASH := 61c9b46617d1370129eee56d4c3b624871818dd5a035766ce2899abf189c9926
 
 PKG_BUILD_DEPENDS := argp-standalone bpf-headers bpftool/host
