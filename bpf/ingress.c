@@ -162,15 +162,26 @@ int ingress_handler(struct xdp_md* xdp) {
   if (ip_proto != IPPROTO_TCP) return XDP_PASS;
   decl_pass(struct tcphdr, tcp, ip_end, xdp);
 
+#if defined(MIMIC_COMPAT_LINUX_6_1) || defined(MIMIC_COMPAT_LINUX_6_6)
+  // Linux 6.1/6.6 verifier struggles to unroll the option-parsing loop below; it
+  // exhausts the 1M insn budget when the loop is entered from divergent states.
+  // Keep the whitelist lookup unconditional at the top (single provably-non-null
+  // settings state crossing the loop) — the geometry proven to load on 6.1/6.6.
+  struct filter_settings* settings = matches_whitelist(QUARTET_TCP);
+  if (!settings) return XDP_PASS;
+#endif
   struct conn_tuple conn_key = gen_conn_key(QUARTET_TCP);
   __u32 payload_len = ip_payload_len - (tcp->doff << 2);
 
   log_tcp(true, &conn_key, tcp, payload_len);
   struct connection* conn = bpf_map_lookup_elem(&mimic_conns, &conn_key);
 
+#if defined(MIMIC_COMPAT_LINUX_6_1) || defined(MIMIC_COMPAT_LINUX_6_6)
+  struct tcp_options opt = {};
+  if (tcp->syn) try_xdp(read_tcp_options(xdp, tcp, ip_end, &opt));
+#else
   __u64 pktbuf = 0;
   __u64 tstamp = bpf_ktime_get_boot_ns();
-
   struct tcp_options opt = {};
   // Unconditional: for non-SYN packets doff==5 -> len==0 -> immediate return, so
   // the call is free. Keeping it straight-line here stops clang from hoisting the
@@ -178,12 +189,47 @@ int ingress_handler(struct xdp_md* xdp) {
   // give the loop two divergent entry states and blow the verifier's 1M insn
   // budget on old kernels (6.1).
   try_xdp(read_tcp_options(xdp, tcp, ip_end, &opt));
+#endif
 
   // XXX: handle matched packets regardless of their checksum. To verify checksum in XDP, loops have
   // to be used, and it is very hard to make verifier happy with variable-length loops. So we just
   // leave the verifying process to the kernel, since invalid packets will remain invalid after
   // processing.
 
+#if defined(MIMIC_COMPAT_LINUX_6_1) || defined(MIMIC_COMPAT_LINUX_6_6)
+  __u64 pktbuf = 0;
+  __u64 tstamp = bpf_ktime_get_boot_ns();
+
+  // Quick path for RST and FIN
+  if (unlikely(tcp->rst || tcp->fin)) {
+    if (conn) {
+      __u32 cooldown;
+      bpf_spin_lock(&conn->lock);
+      swap(pktbuf, conn->pktbuf);
+      conn_reset(conn, tstamp);
+      cooldown = conn_cooldown_display(conn);
+      bpf_spin_unlock(&conn->lock);
+      use_pktbuf(RB_ITEM_FREE_PKTBUF, pktbuf);
+      if (tcp->rst) {
+        log_destroy(&conn_key, DESTROY_RECV_RST, cooldown);
+      } else {
+        send_ctrl_packet(&conn_key, TCP_FLAG_RST, htonl(tcp->ack_seq), 0, 0);
+        log_destroy(&conn_key, DESTROY_RECV_FIN, cooldown);
+      }
+    }
+    return XDP_DROP;
+  }
+
+  if (unlikely(!conn)) {
+    if (!tcp->syn || tcp->ack) {
+      send_ctrl_packet(&conn_key, TCP_FLAG_RST, htonl(tcp->ack_seq), 0, 0);
+      return XDP_DROP;
+    }
+    struct connection conn_value = conn_init(settings, tstamp);
+    try_drop(bpf_map_update_elem(&mimic_conns, &conn_key, &conn_value, BPF_ANY));
+    conn = try_p_drop(bpf_map_lookup_elem(&mimic_conns, &conn_key));
+  }
+#else
   // Whitelist is only consulted for unknown flows: an existing connection entry
   // was already whitelist-verified at creation time, and the fast path below only
   // reads conn->settings. The block is placed after the option-parsing loop so the
@@ -223,6 +269,7 @@ int ingress_handler(struct xdp_md* xdp) {
     }
     return XDP_DROP;
   }
+#endif
 
   bool is_keepalive, will_send_ctrl_packet, will_drop, newly_estab;
   is_keepalive = newly_estab = false;
