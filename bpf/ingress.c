@@ -171,12 +171,26 @@ int ingress_handler(struct xdp_md* xdp) {
   __u64 pktbuf = 0;
   __u64 tstamp = bpf_ktime_get_boot_ns();
 
+  struct tcp_options opt = {};
+  // Unconditional: for non-SYN packets doff==5 -> len==0 -> immediate return, so
+  // the call is free. Keeping it straight-line here stops clang from hoisting the
+  // whitelist/conn-init block (below) above this option-parsing loop, which would
+  // give the loop two divergent entry states and blow the verifier's 1M insn
+  // budget on old kernels (6.1).
+  try_xdp(read_tcp_options(xdp, tcp, ip_end, &opt));
+
+  // XXX: handle matched packets regardless of their checksum. To verify checksum in XDP, loops have
+  // to be used, and it is very hard to make verifier happy with variable-length loops. So we just
+  // leave the verifying process to the kernel, since invalid packets will remain invalid after
+  // processing.
+
   // Whitelist is only consulted for unknown flows: an existing connection entry
   // was already whitelist-verified at creation time, and the fast path below only
-  // reads conn->settings. Keeping settings block-local (instead of hoisting it
-  // past the option-parsing loop below) prevents the verifier from tracking a
-  // map_value_or_null across loop unrolling, which would blow past the
-  // BPF_COMPLEXITY_LIMIT_INSNS budget.
+  // reads conn->settings. The block is placed after the option-parsing loop so the
+  // loop's pre-state is a single conn lookup; hoisting the whitelist lookup (or any
+  // other conditional map op) before the loop would make the verifier walk the loop
+  // once per entry state and blow the BPF_COMPLEXITY_LIMIT_INSNS budget on old
+  // kernels (6.1).
   if (unlikely(!conn)) {
     struct filter_settings* settings = matches_whitelist(QUARTET_TCP);
     if (!settings) return XDP_PASS;
@@ -189,14 +203,6 @@ int ingress_handler(struct xdp_md* xdp) {
     try_drop(bpf_map_update_elem(&mimic_conns, &conn_key, &conn_value, BPF_ANY));
     conn = try_p_drop(bpf_map_lookup_elem(&mimic_conns, &conn_key));
   }
-
-  struct tcp_options opt = {};
-  if (tcp->syn) try_xdp(read_tcp_options(xdp, tcp, ip_end, &opt));
-
-  // XXX: handle matched packets regardless of their checksum. To verify checksum in XDP, loops have
-  // to be used, and it is very hard to make verifier happy with variable-length loops. So we just
-  // leave the verifying process to the kernel, since invalid packets will remain invalid after
-  // processing.
 
   // Quick path for RST and FIN
   if (unlikely(tcp->rst || tcp->fin)) {
