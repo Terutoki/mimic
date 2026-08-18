@@ -135,7 +135,6 @@ int egress_handler(struct __sk_buff* skb) {
   __u16 udp_len = ntohs(udp->len);
   __u16 payload_len = udp_len - sizeof(*udp);
   __u32 seq = 0, ack_seq = 0, padding;
-  __u32 random = bpf_get_prandom_u32();
 
   bpf_spin_lock(&conn->lock);
   if (likely(conn->state == CONN_ESTABLISHED)) {
@@ -177,6 +176,9 @@ int egress_handler(struct __sk_buff* skb) {
         bpf_spin_unlock(&conn->lock);
         return TC_ACT_STOLEN;
       }
+      // PRNG is only consumed here (initial sequence number); the established
+      // fast path no longer pays for it.
+      __u32 random = bpf_get_prandom_u32();
       conn->state = CONN_SYN_SENT;
       seq = conn->seq = random;
       conn->seq += 1;
@@ -224,8 +226,12 @@ int egress_handler(struct __sk_buff* skb) {
     ipv4->protocol = IPPROTO_TCP;
 
     int off = l2_end + IPV4_CSUM_OFF;
-    try_shot(bpf_l3_csum_replace(skb, off, old_len, new_len, 2));
-    try_shot(bpf_l3_csum_replace(skb, off, htons(IPPROTO_UDP), htons(IPPROTO_TCP), 2));
+    // Fold (len_delta + proto_delta) into a single 16-bit one's complement delta
+    // so IPv4 packets pay one l3_csum_replace call instead of two.
+    __u32 delta = (__u16)~old_len + new_len + htons(IPPROTO_TCP) + (__u16)~htons(IPPROTO_UDP);
+    delta = (delta & 0xffff) + (delta >> 16);
+    delta = (delta & 0xffff) + (delta >> 16);
+    try_shot(bpf_l3_csum_replace(skb, off, 0, (__be16)delta, 2));
   } else if (ipv6) {
     ipv6->payload_len = htons(ntohs(ipv6->payload_len) + reserve_len);
     ipv6->nexthdr = IPPROTO_TCP;

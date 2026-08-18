@@ -89,7 +89,8 @@ struct queue_node* queue_pop(struct queue* q);
 void queue_node_free(struct queue_node* node);
 void queue_free(struct queue* q);
 
-// TODO: limit stored packet count/size
+// Cap buffered bytes per connection so a stalled handshake cannot OOM userspace
+#define MAX_PACKET_BUF_SIZE (1 << 24)
 struct packet_buf {
   struct conn_tuple conn;
   struct queue queue;

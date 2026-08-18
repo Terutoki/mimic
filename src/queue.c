@@ -81,6 +81,7 @@ struct packet_buf* packet_buf_new(struct conn_tuple* conn) {
 }
 
 int packet_buf_push(struct packet_buf* buf, const char* data, size_t len, bool l4_csum_partial) {
+  if (buf->size + len > MAX_PACKET_BUF_SIZE) return 0;  // drop new packets once buffer is full
   struct packet* pkt = try_p(packet_new(data, len, l4_csum_partial));
   queue_push(&buf->queue, pkt, _packet_free_void);
   buf->size += len;
