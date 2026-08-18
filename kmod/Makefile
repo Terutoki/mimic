@@ -53,7 +53,7 @@ BWRAP := bwrap \
 
 RESOLVE_BTFIDS ?= /usr/lib/mimic/resolve_btfids
 
-path_extension := PATH="$$PATH:/usr/lib/mimic:$(CURDIR)/../out:$(CURDIR)/../tools"
+path_extension := PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$$PATH:/usr/lib/mimic:$(CURDIR)/../out:$(CURDIR)/../tools"
 VMLINUX_TO_BTF ?= $(path_extension) vmlinux-to-btf
 export EXTRACT_VMLINUX ?= $(path_extension) extract-vmlinux
 export EXTRACT_BTF ?= $(path_extension) extract-btf
@@ -67,6 +67,7 @@ all: build
 .PHONY: build
 build:
 ifdef enable_build_hack
+	@command -v pahole >/dev/null 2>&1 || { echo "ERROR: pahole not found. Install it: apt install dwarves (Debian 12 and older) or pahole (Debian 13+, Ubuntu). It is required for BTF generation of the kfunc variant."; exit 1; }
 	-cp -rL $(SYSTEM_BUILD_DIR) overlay
 ifeq ($(vmlinux_exists),0)
 	$(VMLINUX_TO_BTF) >overlay/vmlinux
@@ -79,7 +80,11 @@ endif
 	install -Dm755 $(RESOLVE_BTFIDS) overlay/tools/bpf/resolve_btfids/resolve_btfids
 endif  # resolve_btfids_exists
 endif  # enable_build_hack
-	$(BWRAP) $(MAKE) -C $(SYSTEM_BUILD_DIR) M=$(CURDIR) modules
+ifdef enable_build_hack
+	$(path_extension) $(BWRAP) $(MAKE) -C $(SYSTEM_BUILD_DIR) M=$(CURDIR) modules
+else
+	$(MAKE) -C $(SYSTEM_BUILD_DIR) M=$(CURDIR) modules
+endif
 
 .PHONY: clean
 clean:
