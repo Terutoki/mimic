@@ -135,6 +135,7 @@ int egress_handler(struct __sk_buff* skb) {
   __u16 udp_len = ntohs(udp->len);
   __u16 payload_len = udp_len - sizeof(*udp);
   __u32 seq = 0, ack_seq = 0, padding;
+  __u32 random = bpf_get_prandom_u32();
 
   bpf_spin_lock(&conn->lock);
   if (likely(conn->state == CONN_ESTABLISHED)) {
@@ -176,9 +177,6 @@ int egress_handler(struct __sk_buff* skb) {
         bpf_spin_unlock(&conn->lock);
         return TC_ACT_STOLEN;
       }
-      // PRNG is only consumed here (initial sequence number); the established
-      // fast path no longer pays for it.
-      __u32 random = bpf_get_prandom_u32();
       conn->state = CONN_SYN_SENT;
       seq = conn->seq = random;
       conn->seq += 1;

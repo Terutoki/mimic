@@ -217,6 +217,7 @@ int ingress_handler(struct xdp_md* xdp) {
 
   __be32 flags = 0;
   __u32 seq = 0, ack_seq = 0, cooldown = 0;
+  __u32 random = bpf_get_prandom_u32();
 
   bpf_spin_lock(&conn->lock);
 
@@ -236,7 +237,6 @@ int ingress_handler(struct xdp_md* xdp) {
         conn->state = CONN_SYN_RECV;
         conn->initiator = false;
         flags |= TCP_FLAG_SYN | TCP_FLAG_ACK;
-        __u32 random = bpf_get_prandom_u32();
         seq = conn->seq = random;
         ack_seq = conn->ack_seq = next_ack_seq(tcp, payload_len);
         conn->seq += 1;
@@ -322,7 +322,6 @@ int ingress_handler(struct xdp_md* xdp) {
       } else br_likely {
         will_send_ctrl_packet = will_drop = false;
         conn->ack_seq = next_ack_seq(tcp, payload_len);
-        __u32 random = bpf_get_prandom_u32();
         __u32 upper_bound = DEFAULT_WINDOW / 2;
         __u32 lower_bound = DEFAULT_WINDOW / 4;
         if (random % (upper_bound - lower_bound) + lower_bound >= conn->window) {
