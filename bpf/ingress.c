@@ -168,11 +168,26 @@ int ingress_handler(struct xdp_md* xdp) {
   log_tcp(true, &conn_key, tcp, payload_len);
   struct connection* conn = bpf_map_lookup_elem(&mimic_conns, &conn_key);
 
-  struct filter_settings* settings = NULL;
+  __u64 pktbuf = 0;
+  __u64 tstamp = bpf_ktime_get_boot_ns();
+
+  // Whitelist is only consulted for unknown flows: an existing connection entry
+  // was already whitelist-verified at creation time, and the fast path below only
+  // reads conn->settings. Keeping settings block-local (instead of hoisting it
+  // past the option-parsing loop below) prevents the verifier from tracking a
+  // map_value_or_null across loop unrolling, which would blow past the
+  // BPF_COMPLEXITY_LIMIT_INSNS budget.
   if (unlikely(!conn)) {
-    // Whitelist verified at conn creation; fast path only reads conn->settings.
-    settings = matches_whitelist(QUARTET_TCP);
+    struct filter_settings* settings = matches_whitelist(QUARTET_TCP);
     if (!settings) return XDP_PASS;
+    if (unlikely(tcp->rst || tcp->fin)) return XDP_DROP;
+    if (!tcp->syn || tcp->ack) {
+      send_ctrl_packet(&conn_key, TCP_FLAG_RST, htonl(tcp->ack_seq), 0, 0);
+      return XDP_DROP;
+    }
+    struct connection conn_value = conn_init(settings, tstamp);
+    try_drop(bpf_map_update_elem(&mimic_conns, &conn_key, &conn_value, BPF_ANY));
+    conn = try_p_drop(bpf_map_lookup_elem(&mimic_conns, &conn_key));
   }
 
   struct tcp_options opt = {};
@@ -182,9 +197,6 @@ int ingress_handler(struct xdp_md* xdp) {
   // to be used, and it is very hard to make verifier happy with variable-length loops. So we just
   // leave the verifying process to the kernel, since invalid packets will remain invalid after
   // processing.
-
-  __u64 pktbuf = 0;
-  __u64 tstamp = bpf_ktime_get_boot_ns();
 
   // Quick path for RST and FIN
   if (unlikely(tcp->rst || tcp->fin)) {
@@ -204,17 +216,6 @@ int ingress_handler(struct xdp_md* xdp) {
       }
     }
     return XDP_DROP;
-  }
-
-  if (unlikely(!conn)) {
-    if (!settings) return XDP_PASS;
-    if (!tcp->syn || tcp->ack) {
-      send_ctrl_packet(&conn_key, TCP_FLAG_RST, htonl(tcp->ack_seq), 0, 0);
-      return XDP_DROP;
-    }
-    struct connection conn_value = conn_init(settings, tstamp);
-    try_drop(bpf_map_update_elem(&mimic_conns, &conn_key, &conn_value, BPF_ANY));
-    conn = try_p_drop(bpf_map_lookup_elem(&mimic_conns, &conn_key));
   }
 
   bool is_keepalive, will_send_ctrl_packet, will_drop, newly_estab;
