@@ -57,8 +57,11 @@ static __always_inline struct filter_settings* matches_whitelist(QUARTET_DEF) {
   remote.ip = ipv4 ? ipv4_mapped(ipv4->daddr) : ipv6 ? ipv6->daddr : IP_ANY;
 
   struct filter_info* result = bpf_map_lookup_elem(&mimic_whitelist, &local);
-  result = result ?: bpf_map_lookup_elem(&mimic_whitelist, &remote);
-  return result ? &result->settings : NULL;
+  if (!result) {
+    result = bpf_map_lookup_elem(&mimic_whitelist, &remote);
+    if (!result) return NULL;
+  }
+  return &result->settings;
 }
 
 static __always_inline struct conn_tuple gen_conn_key(QUARTET_DEF) {

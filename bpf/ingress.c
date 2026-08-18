@@ -162,13 +162,18 @@ int ingress_handler(struct xdp_md* xdp) {
   if (ip_proto != IPPROTO_TCP) return XDP_PASS;
   decl_pass(struct tcphdr, tcp, ip_end, xdp);
 
-  struct filter_settings* settings = matches_whitelist(QUARTET_TCP);
-  if (!settings) return XDP_PASS;
   struct conn_tuple conn_key = gen_conn_key(QUARTET_TCP);
   __u32 payload_len = ip_payload_len - (tcp->doff << 2);
 
   log_tcp(true, &conn_key, tcp, payload_len);
   struct connection* conn = bpf_map_lookup_elem(&mimic_conns, &conn_key);
+
+  struct filter_settings* settings = NULL;
+  if (unlikely(!conn)) {
+    // Whitelist verified at conn creation; fast path only reads conn->settings.
+    settings = matches_whitelist(QUARTET_TCP);
+    if (!settings) return XDP_PASS;
+  }
 
   struct tcp_options opt = {};
   if (tcp->syn) try_xdp(read_tcp_options(xdp, tcp, ip_end, &opt));
@@ -202,6 +207,7 @@ int ingress_handler(struct xdp_md* xdp) {
   }
 
   if (unlikely(!conn)) {
+    if (!settings) return XDP_PASS;
     if (!tcp->syn || tcp->ack) {
       send_ctrl_packet(&conn_key, TCP_FLAG_RST, htonl(tcp->ack_seq), 0, 0);
       return XDP_DROP;

@@ -118,11 +118,12 @@ int egress_handler(struct __sk_buff* skb) {
 
   __u64 tstamp = bpf_ktime_get_boot_ns();
 
-  struct filter_settings* settings = matches_whitelist(QUARTET_UDP);
-  if (!settings) return TC_ACT_OK;
   struct conn_tuple conn_key = gen_conn_key(QUARTET_UDP);
   struct connection* conn = bpf_map_lookup_elem(&mimic_conns, &conn_key);
   if (unlikely(!conn)) {
+    // Whitelist verified at conn creation; fast path only reads conn->settings.
+    struct filter_settings* settings = matches_whitelist(QUARTET_UDP);
+    if (!settings) return TC_ACT_OK;
     if (settings->handshake.interval == 0) return TC_ACT_STOLEN;  // passive mode
     struct connection conn_value = conn_init(settings, tstamp);
     try_shot(bpf_map_update_elem(&mimic_conns, &conn_key, &conn_value, BPF_ANY));
