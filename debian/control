@@ -48,7 +48,7 @@ Depends:
  ${misc:Depends},
  ${shlibs:Depends},
 Recommends:
- pahole,
+ dwarves | pahole,
  bubblewrap,
  xz-utils,
  lz4,

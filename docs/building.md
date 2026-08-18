@@ -6,7 +6,7 @@
 - **GNU make**
 - **Clang**: version >= 15 (for Linux 6.1, also < 20)
 - **GCC** (if kernel is built using it)
-- **pahole, bpftool**: for generating BPF stuff
+- **pahole, bpftool**: for generating BPF stuff. The `pahole` command is provided by the `dwarves` package on Debian 12 and older (the `pahole` package name only exists on Debian 13 and later); on other distros check your package manager for either name.
 - **libbpf 1.x**: `apt install libbpf-dev` on Debian or similar
 - **libffi**: `apt install libffi-dev` on Debian or similar
 - **argp-standalone** (if not glibc)
