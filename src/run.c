@@ -355,80 +355,98 @@ static int do_routine(int conns_fd, const char* ifname) {
   __u64 tstamp = ts.tv_sec * SECOND + ts.tv_nsec;
 
   struct queue free_queue = {};
-  struct conn_tuple key;
-  struct connection conn;
-  struct bpf_map_iter iter = {.map_fd = conns_fd, .map_name = "mimic_conns"};
+  // Batch lookup replaces the per-connection get_next_key + lookup pair: 2N
+  // syscalls/sec become ~2N/64, and each bucket spinlock is taken once per
+  // batch instead of once per connection (spinning on it here delays the
+  // datapath which grabs the same lock). BPF_F_LOCK keeps the locked-read
+  // semantics of the old loop; the kernel's hash batch ops honor it since 5.6
+  // (out_batch is a 4-byte bucket cursor, a final -ENOENT ends the sweep).
+  enum { DO_ROUTINE_BATCH = 64 };
+  struct conn_tuple keys[DO_ROUTINE_BATCH];
+  struct connection conns[DO_ROUTINE_BATCH];
+  struct conn_tuple out_batch;
+  void* in_batch = NULL;
+  struct bpf_map_batch_opts opts = {.sz = sizeof(opts), .elem_flags = BPF_F_LOCK};
 
-  while (try2(bpf_map_iter_next(&iter, &key))) {
-    bool reset = false, remove = false;
-    try2(bpf_map_lookup_elem_flags(conns_fd, &key, &conn, BPF_F_LOCK),
-         _("failed to get value from map '%s': %s"), "mimic_conns", strret);
+  for (;;) {
+    __u32 count = DO_ROUTINE_BATCH;
+    int err = bpf_map_lookup_batch(conns_fd, in_batch, &out_batch, keys, conns, &count,
+                                   &opts);
+    if (err < 0 && err != -ENOENT)
+      try2(err, _("failed to batch lookup map '%s': %s"), "mimic_conns", strret);
+    for (__u32 i = 0; i < count; i++) {
+      struct conn_tuple* key = &keys[i];
+      struct connection* conn = &conns[i];
+      bool reset = false, remove = false;
 
-    int retry_secs = time_diff(SECOND, tstamp, conn.retry_tstamp);
-    switch (conn.state) {
-      case CONN_IDLE:
-        if (time_diff(SECOND, tstamp, conn.stale_tstamp) >= conn_cooldown(&conn) * 2) remove = true;
-        break;
-      case CONN_SYN_SENT:
-        if (retry_secs >= (conn.settings.handshake.retry + 1) * conn.settings.handshake.interval) {
-          reset = true;
-        } else if (retry_secs != 0 && retry_secs % conn.settings.handshake.interval == 0) {
-          log_conn(LOG_INFO, &key, _("retry sending SYN"));
-          send_ctrl_packet(&key, TCP_FLAG_SYN | conn_max_window(&conn), conn.seq - 1, 0,
-                           conn.window, ifname);
-        }
-        break;
-      case CONN_SYN_RECV:
-        if (retry_secs >= (conn.settings.handshake.retry + 1) * conn.settings.handshake.interval)
-          reset = true;
-        break;
-      case CONN_ESTABLISHED:
-        if (conn.settings.keepalive.stale > 0 &&
-            time_diff(SECOND, tstamp, conn.stale_tstamp) >= (__u32)conn.settings.keepalive.stale) {
-          reset = remove = true;
-        } else if (conn.settings.keepalive.time > 0 && retry_secs >= conn.settings.keepalive.time) {
-          if (conn.settings.keepalive.interval <= 0) {
+      int retry_secs = time_diff(SECOND, tstamp, conn->retry_tstamp);
+      switch (conn->state) {
+        case CONN_IDLE:
+          if (time_diff(SECOND, tstamp, conn->stale_tstamp) >= conn_cooldown(conn) * 2) remove = true;
+          break;
+        case CONN_SYN_SENT:
+          if (retry_secs >= (conn->settings.handshake.retry + 1) * conn->settings.handshake.interval) {
             reset = true;
-          } else if (conn.retry_tstamp >= conn.reset_tstamp) {
-            log_conn(LOG_DEBUG, &key, _("sending keepalive"));
-            conn.reset_tstamp = tstamp;
-            conn.keepalive_sent = true;
-            send_ctrl_packet(&key, TCP_FLAG_ACK | conn_max_window(&conn), conn.seq - 1,
-                             conn.ack_seq, conn.window, ifname);
-            bpf_map_update_elem(conns_fd, &key, &conn, BPF_EXIST | BPF_F_LOCK);
-          } else {
-            int reset_secs = time_diff(SECOND, tstamp, conn.reset_tstamp);
-            if (reset_secs >= conn.settings.keepalive.retry * conn.settings.keepalive.interval) {
+          } else if (retry_secs != 0 && retry_secs % conn->settings.handshake.interval == 0) {
+            log_conn(LOG_INFO, key, _("retry sending SYN"));
+            send_ctrl_packet(key, TCP_FLAG_SYN | conn_max_window(conn), conn->seq - 1, 0,
+                             conn->window, ifname);
+          }
+          break;
+        case CONN_SYN_RECV:
+          if (retry_secs >= (conn->settings.handshake.retry + 1) * conn->settings.handshake.interval)
+            reset = true;
+          break;
+        case CONN_ESTABLISHED:
+          if (conn->settings.keepalive.stale > 0 &&
+              time_diff(SECOND, tstamp, conn->stale_tstamp) >= (__u32)conn->settings.keepalive.stale) {
+            reset = remove = true;
+          } else if (conn->settings.keepalive.time > 0 && retry_secs >= conn->settings.keepalive.time) {
+            if (conn->settings.keepalive.interval <= 0) {
               reset = true;
-            } else if (reset_secs % conn.settings.keepalive.interval == 0) {
-              log_conn(LOG_DEBUG, &key, _("sending keepalive"));
-              send_ctrl_packet(&key, TCP_FLAG_ACK | conn_max_window(&conn), conn.seq - 1,
-                               conn.ack_seq, conn.window, ifname);
+            } else if (conn->retry_tstamp >= conn->reset_tstamp) {
+              log_conn(LOG_DEBUG, key, _("sending keepalive"));
+              conn->reset_tstamp = tstamp;
+              conn->keepalive_sent = true;
+              send_ctrl_packet(key, TCP_FLAG_ACK | conn_max_window(conn), conn->seq - 1,
+                               conn->ack_seq, conn->window, ifname);
+              bpf_map_update_elem(conns_fd, key, conn, BPF_EXIST | BPF_F_LOCK);
+            } else {
+              int reset_secs = time_diff(SECOND, tstamp, conn->reset_tstamp);
+              if (reset_secs >= conn->settings.keepalive.retry * conn->settings.keepalive.interval) {
+                reset = true;
+              } else if (reset_secs % conn->settings.keepalive.interval == 0) {
+                log_conn(LOG_DEBUG, key, _("sending keepalive"));
+                send_ctrl_packet(key, TCP_FLAG_ACK | conn_max_window(conn), conn->seq - 1,
+                                 conn->ack_seq, conn->window, ifname);
+              }
             }
           }
-        }
-        break;
-      default: break;
-    }
-
-    if (reset) {
-      if (!remove) {
-        struct packet_buf* orig_pktbuf = (typeof(orig_pktbuf))(uintptr_t)conn.pktbuf;
-        conn.pktbuf = 0;
-        conn_reset(&conn, tstamp);
-        bpf_map_update_elem(conns_fd, &key, &conn, BPF_EXIST | BPF_F_LOCK);
-        packet_buf_free(orig_pktbuf);
+          break;
+        default: break;
       }
-      log_destroy(LOG_WARN, &key, DESTROY_TIMED_OUT, conn_cooldown_display(&conn));
-      send_ctrl_packet(&key, TCP_FLAG_RST, conn.seq, 0, 0, ifname);
+
+      if (reset) {
+        if (!remove) {
+          struct packet_buf* orig_pktbuf = (typeof(orig_pktbuf))(uintptr_t)conn->pktbuf;
+          conn->pktbuf = 0;
+          conn_reset(conn, tstamp);
+          bpf_map_update_elem(conns_fd, key, conn, BPF_EXIST | BPF_F_LOCK);
+          packet_buf_free(orig_pktbuf);
+        }
+        log_destroy(LOG_WARN, key, DESTROY_TIMED_OUT, conn_cooldown_display(conn));
+        send_ctrl_packet(key, TCP_FLAG_RST, conn->seq, 0, 0, ifname);
+      }
+      if (remove) {
+        struct _conn_to_free* item = malloc(sizeof(*item));
+        item->key = *key;
+        item->buf = (struct packet_buf*)(uintptr_t)conn->pktbuf;
+        queue_push(&free_queue, item, free);
+        log_conn(LOG_DEBUG, key, _("connection removed"));
+      }
     }
-    if (remove) {
-      struct _conn_to_free* item = malloc(sizeof(*item));
-      item->key = key;
-      item->buf = (struct packet_buf*)(uintptr_t)conn.pktbuf;
-      queue_push(&free_queue, item, free);
-      log_conn(LOG_DEBUG, &key, _("connection removed"));
-    }
+    if (err < 0 || count == 0) break;
+    in_batch = &out_batch;
   }
 
   retcode = 0;

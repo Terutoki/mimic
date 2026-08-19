@@ -116,8 +116,6 @@ int egress_handler(struct __sk_buff* skb) {
   if (ip_proto != IPPROTO_UDP) return TC_ACT_OK;
   decl_ok(struct udphdr, udp, ip_end, skb);
 
-  __u64 tstamp = bpf_ktime_get_boot_ns();
-
   struct conn_tuple conn_key = gen_conn_key(QUARTET_UDP);
   struct connection* conn = bpf_map_lookup_elem(&mimic_conns, &conn_key);
   if (unlikely(!conn)) {
@@ -125,6 +123,7 @@ int egress_handler(struct __sk_buff* skb) {
     struct filter_settings* settings = matches_whitelist(QUARTET_UDP);
     if (!settings) return TC_ACT_OK;
     if (settings->handshake.interval == 0) return TC_ACT_STOLEN;  // passive mode
+    __u64 tstamp = bpf_ktime_get_boot_ns();
     struct connection conn_value = conn_init(settings, tstamp);
     try_shot(bpf_map_update_elem(&mimic_conns, &conn_key, &conn_value, BPF_ANY));
     conn = try_p_shot(bpf_map_lookup_elem(&mimic_conns, &conn_key));
@@ -136,7 +135,15 @@ int egress_handler(struct __sk_buff* skb) {
   __u16 udp_len = ntohs(udp->len);
   __u16 payload_len = udp_len - sizeof(*udp);
   __u32 seq = 0, ack_seq = 0, padding;
-  __u32 random = bpf_get_prandom_u32();
+  // Neither value is used on the established fast path with a healthy peer
+  // window, so fetch them lazily instead of paying two helper calls per packet.
+  // The unlocked reads are only a cost heuristic; decisions happen under the
+  // lock below, so a stale prediction at worst wastes a call (or, in the rarest
+  // of races, defers one window probe by a single packet).
+  bool slow_path = unlikely(conn->state != CONN_ESTABLISHED ||
+                            conn->peer_window < DEFAULT_WINDOW / 2);
+  __u64 tstamp = slow_path ? bpf_ktime_get_boot_ns() : 0;
+  __u32 random = slow_path ? bpf_get_prandom_u32() : 0;
 
   bpf_spin_lock(&conn->lock);
   if (likely(conn->state == CONN_ESTABLISHED)) {

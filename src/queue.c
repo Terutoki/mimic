@@ -111,17 +111,26 @@ int packet_buf_consume(struct packet_buf* buf, bool* consumed) {
   try_e(bind(sk, (struct sockaddr*)&saddr, sizeof(saddr)));
 
   int ret = 0;
+  size_t total = 0, dropped = 0;
   struct queue_node* pn;
   while ((pn = queue_pop(&buf->queue))) {
     struct packet* p = pn->data;
-    ret = ret ?: sendto(sk, p->data, p->len, 0, (struct sockaddr*)&daddr, sizeof(daddr));
-    if (ret > 0) ret = 0;
+    total++;
+    // Attempt every packet regardless of earlier failures: a single sendto
+    // error (e.g. EAGAIN on the non-blocking socket) must not silently drop
+    // the rest of the burst.
+    ssize_t n = sendto(sk, p->data, p->len, 0, (struct sockaddr*)&daddr, sizeof(daddr));
+    if (n < 0) {
+      ret = ret ?: -errno;
+      dropped++;
+    }
     queue_node_free(pn);
   }
+  if (dropped) log_debug(_("packet_buf_consume: dropped %zu/%zu packet(s)"), dropped, total);
 
   *consumed = true;
   free(buf);
-  return ret < 0 ? -errno : 0;
+  return ret;
 }
 
 void packet_buf_drain(struct packet_buf* buf) {
