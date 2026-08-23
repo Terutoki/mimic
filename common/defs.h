@@ -170,8 +170,9 @@ static inline void freestrp(char** ptr) { freep((void*)ptr); }
 #define MAX_PADDING_LEN 16
 #define PADDING_RANDOM (-127)
 
-// Used for reading packet data in bulk
-#define SEGMENT_SIZE 64
+// Used for reading packet data in bulk. Larger chunks mean fewer helper calls
+// per buffered packet (see store_packet); bounded by verifier complexity.
+#define SEGMENT_SIZE 512
 
 // Value of window size should be calculated from:
 //   2 * 1000 * speed (MB/s) * latency (ms)

@@ -31,6 +31,18 @@ extern struct mimic_rb_map {
   __uint(max_entries, 1 << 22);
 } mimic_rb;
 
+struct rst_throttle_cell {
+  __u64 tstamp;
+  __u32 tokens;
+};
+
+extern struct rst_throttle_map {
+  __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+  __uint(max_entries, 1);
+  __type(key, __u32);
+  __type(value, struct rst_throttle_cell);
+} rst_throttle;
+
 #define IPV4_CSUM_OFF (offsetof(struct iphdr, check))
 #define TCP_UDP_HEADER_DIFF (sizeof(struct tcphdr) - sizeof(struct udphdr))
 #define MAX_RESERVE_LEN (TCP_UDP_HEADER_DIFF + MAX_PADDING_LEN)
@@ -115,6 +127,7 @@ static inline void log_destroy(struct conn_tuple* conn, enum destroy_type type, 
 int send_ctrl_packet(struct conn_tuple* conn, __be32 flags, __u32 seq, __u32 ack_seq, __u32 window);
 int store_packet(struct __sk_buff* skb, __u32 pkt_off, struct conn_tuple* key, int ip_summed);
 int use_pktbuf(enum rb_item_type type, __u64 buf);
+int rst_rate_ok(__u64 now);
 
 #define _log_a(_0, _1, _2, _3, N, ...) _##N
 #define _log_b_0() (__u64[0]){}, 0

@@ -98,15 +98,41 @@ struct packet_buf {
 };
 
 struct packet {
-  char* data;
   size_t len;
+  char data[];
 };
+
+struct raw_sock_cache;
 
 struct packet_buf* packet_buf_new(struct conn_tuple* conn);
 int packet_buf_push(struct packet_buf* buf, const char* data, size_t len, bool l4_csum_partial);
-int packet_buf_consume(struct packet_buf* buf, bool* consumed);
+int packet_buf_consume(struct packet_buf* buf, struct raw_sock_cache* cache,
+                       bool* consumed);
 void packet_buf_drain(struct packet_buf* buf);
 void packet_buf_free(struct packet_buf* buf);
+
+// Raw sockets receive kernel copies of every matching packet while open, so
+// they are cached only for the duration of one event batch and flushed right
+// after it (see raw_sock_flush), keeping the window in which traffic gets
+// mirrored to us as short as the original open-send-close pattern.
+enum { RAW_SOCK_ENTRIES = 4 };  // {AF_INET, AF_INET6} x {IPPROTO_TCP, IPPROTO_UDP}
+
+struct raw_sock_entry {
+  int fd;
+  bool bound;
+  struct in6_addr addr;
+};
+
+struct raw_sock_cache {
+  struct raw_sock_entry entries[RAW_SOCK_ENTRIES];
+};
+
+int raw_sock_get(struct raw_sock_cache* cache, int family, int proto,
+                 const struct in6_addr* local);
+void raw_sock_flush(struct raw_sock_cache* cache);
+static inline void raw_sock_cache_init(struct raw_sock_cache* cache) {
+  for (int i = 0; i < RAW_SOCK_ENTRIES; i++) cache->entries[i].fd = -1;
+}
 
 int notify_ready();
 

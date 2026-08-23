@@ -34,8 +34,13 @@ static inline int mangle_data(struct __sk_buff* skb, __u16 offset, __be32* csum_
     bpf_gt0_hack2(padding_len);
     padding_len = min(padding_len, MAX_PADDING_LEN);
 
-    for (size_t i = 0; i < padding_len / 4 + !!(padding_len % 4); i++)
-      ((__u32*)buf)[i] = bpf_get_prandom_u32();
+    // One helper call feeds an LCG for the whole padding; padding only needs
+    // to look random on the wire, not be cryptographically unpredictable.
+    __u32 rnd = bpf_get_prandom_u32();
+    for (size_t i = 0; i < padding_len / 4 + !!(padding_len % 4); i++) {
+      ((__u32*)buf)[i] = rnd;
+      rnd = rnd * 1664525u + 1013904223u;
+    }
     // HACK: prevent usage of __builtin_memset against variable size
     switch (padding_len % 4) {
       case 1: buf[padding_len + 2] = 0; fallthrough;

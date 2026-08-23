@@ -12,6 +12,32 @@ enum link_type link_type;
 struct mimic_whitelist_map mimic_whitelist SEC(".maps");
 struct mimic_conns_map mimic_conns SEC(".maps");
 struct mimic_rb_map mimic_rb SEC(".maps");
+struct rst_throttle_map rst_throttle SEC(".maps");
+
+// Unsolicited RST replies (stray packets to whitelisted ports, invalid
+// segments) are the only unbounded userspace-work trigger an external party
+// controls: each one crosses the ringbuf and costs the daemon a socket setup.
+// A per-CPU token bucket caps them without touching legitimate control traffic
+// (handshake, keepalive, window probes stay ungated).
+#define RST_THROTTLE_BURST 128
+#define RST_THROTTLE_RATE 64  // tokens per second
+
+int rst_rate_ok(__u64 now) {
+  __u32 zero = 0;
+  struct rst_throttle_cell* cell = bpf_map_lookup_elem(&rst_throttle, &zero);
+  if (!cell) return 1;
+  __u64 elapsed = now - cell->tstamp;
+  if (elapsed >= SECOND) {
+    __u64 secs = elapsed / SECOND;
+    __u64 refill = secs * RST_THROTTLE_RATE;
+    cell->tstamp += secs * SECOND;
+    __u32 tokens = cell->tokens + (__u32)min(refill, (__u64)RST_THROTTLE_BURST);
+    cell->tokens = min(tokens, (__u32)RST_THROTTLE_BURST);
+  }
+  if (!cell->tokens) return 0;
+  cell->tokens--;
+  return 1;
+}
 
 int send_ctrl_packet(struct conn_tuple* conn, __be32 flags, __u32 seq, __u32 ack_seq,
                      __u32 window) {

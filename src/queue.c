@@ -1,3 +1,5 @@
+#define _GNU_SOURCE
+
 #include <arpa/inet.h>
 #include <errno.h>
 #include <linux/types.h>
@@ -54,9 +56,8 @@ void queue_free(struct queue* q) {
 }
 
 static inline struct packet* packet_new(const char* data, size_t len, bool l4_csum_partial) {
-  struct packet* result = malloc(sizeof(*result));
+  struct packet* result = malloc(sizeof(*result) + len);
   if (!result) return NULL;
-  result->data = malloc(len);
   result->len = len;
   memcpy(result->data, data, len);
   if (l4_csum_partial) {
@@ -66,12 +67,60 @@ static inline struct packet* packet_new(const char* data, size_t len, bool l4_cs
   return result;
 }
 
-static inline void packet_free(struct packet* p) {
-  free(p->data);
-  free(p);
-}
+static inline void packet_free(struct packet* p) { free(p); }
 
 static inline void _packet_free_void(void* p) { packet_free(p); }
+
+static int raw_sock_idx(int family, int proto) {
+  return (family == AF_INET6 ? 1 : 0) + (proto == IPPROTO_UDP ? 2 : 0);
+}
+
+int raw_sock_get(struct raw_sock_cache* cache, int family, int proto,
+                 const struct in6_addr* local) {
+  struct raw_sock_entry* entry = &cache->entries[raw_sock_idx(family, proto)];
+  if (entry->fd >= 0 && entry->bound && memcmp(&entry->addr, local, sizeof(*local)) == 0)
+    return entry->fd;
+
+  if (entry->fd >= 0) close(entry->fd);
+  entry->bound = false;
+
+  int sk = socket(family, SOCK_RAW | SOCK_NONBLOCK, proto);
+  if (sk < 0) return -errno;
+
+  struct sockaddr_storage saddr;
+  socklen_t slen;
+  if (family == AF_INET) {
+    struct sockaddr_in* sa = (typeof(sa))&saddr;
+    *sa = (typeof(*sa)){.sin_family = AF_INET, .sin_addr = {local->s6_addr32[3]}};
+    slen = sizeof(*sa);
+  } else {
+    struct sockaddr_in6* sa6 = (typeof(sa6))&saddr;
+    *sa6 = (typeof(*sa6)){.sin6_family = AF_INET6, .sin6_addr = *local};
+    slen = sizeof(*sa6);
+  }
+
+  int yes = 1;
+  if (setsockopt(sk, family == AF_INET6 ? SOL_IPV6 : SOL_IP,
+                 family == AF_INET6 ? IPV6_FREEBIND : IP_FREEBIND, &yes,
+                 sizeof(yes)) < 0 ||
+      bind(sk, (struct sockaddr*)&saddr, slen) < 0) {
+    int saved = -errno;
+    close(sk);
+    return saved;
+  }
+
+  entry->fd = sk;
+  entry->bound = true;
+  entry->addr = *local;
+  return sk;
+}
+
+void raw_sock_flush(struct raw_sock_cache* cache) {
+  for (int i = 0; i < RAW_SOCK_ENTRIES; i++) {
+    if (cache->entries[i].fd >= 0) close(cache->entries[i].fd);
+    cache->entries[i] = (struct raw_sock_entry){.fd = -1};
+  }
+}
 
 struct packet_buf* packet_buf_new(struct conn_tuple* conn) {
   struct packet_buf* result = calloc(1, sizeof(*result));
@@ -88,7 +137,7 @@ int packet_buf_push(struct packet_buf* buf, const char* data, size_t len, bool l
   return 0;
 }
 
-int packet_buf_consume(struct packet_buf* buf, bool* consumed) {
+int packet_buf_consume(struct packet_buf* buf, struct raw_sock_cache* cache, bool* consumed) {
   if (!buf) {
     *consumed = true;
     return 0;
@@ -98,33 +147,49 @@ int packet_buf_consume(struct packet_buf* buf, bool* consumed) {
     return 0;
   }
 
-  int sk raii(closep) =
-    try_e(socket(ip_proto(&buf->conn.local), SOCK_RAW | SOCK_NONBLOCK, IPPROTO_UDP));
+  int sk = raw_sock_get(cache, ip_proto(&buf->conn.local), IPPROTO_UDP, &buf->conn.local);
+  if (sk < 0) return sk;
   struct sockaddr_storage saddr, daddr;
   conn_tuple_to_addrs(&buf->conn, &saddr, &daddr);
 
-  if (log_verbosity >= LOG_DEBUG) {
-    char ip_str[INET6_ADDRSTRLEN];
-    inet_ntop(ip_proto(&buf->conn.local), ip_buf(&buf->conn.local), ip_str, sizeof(ip_str));
-    log_conn(LOG_DEBUG, &buf->conn, _("pktbuf_consume: trying to bind %s"), ip_str);
-  }
-  try_e(bind(sk, (struct sockaddr*)&saddr, sizeof(saddr)));
-
   int ret = 0;
   size_t total = 0, dropped = 0;
-  struct queue_node* pn;
-  while ((pn = queue_pop(&buf->queue))) {
-    struct packet* p = pn->data;
-    total++;
-    // Attempt every packet regardless of earlier failures: a single sendto
-    // error (e.g. EAGAIN on the non-blocking socket) must not silently drop
-    // the rest of the burst.
-    ssize_t n = sendto(sk, p->data, p->len, 0, (struct sockaddr*)&daddr, sizeof(daddr));
-    if (n < 0) {
-      ret = ret ?: -errno;
-      dropped++;
+  enum { PKT_SEND_BATCH = 64 };
+  struct mmsghdr msgs[PKT_SEND_BATCH];
+  struct iovec iovs[PKT_SEND_BATCH];
+  struct queue_node* nodes[PKT_SEND_BATCH];
+  for (;;) {
+    __u32 n = 0;
+    struct queue_node* pn;
+    while (n < PKT_SEND_BATCH && (pn = queue_pop(&buf->queue))) {
+      struct packet* p = pn->data;
+      nodes[n] = pn;
+      iovs[n] = (struct iovec){.iov_base = p->data, .iov_len = p->len};
+      msgs[n] = (struct mmsghdr){
+        .msg_hdr =
+          {
+            .msg_name = &daddr,
+            .msg_namelen = sizeof(daddr),
+            .msg_iov = &iovs[n],
+            .msg_iovlen = 1,
+          },
+      };
+      n++;
     }
-    queue_node_free(pn);
+    if (n == 0) break;
+
+    // Attempt the whole batch regardless of earlier failures: a single error
+    // (e.g. EAGAIN on the non-blocking socket) must not silently drop
+    // the rest of the burst.
+    int sent = sendmmsg(sk, msgs, n, 0);
+    if (sent < 0) {
+      ret = ret ?: -errno;
+      dropped += n;
+    } else {
+      dropped += n - (__u32)sent;
+    }
+    total += n;
+    for (__u32 i = 0; i < n; i++) queue_node_free(nodes[i]);
   }
   if (dropped) log_debug(_("packet_buf_consume: dropped %zu/%zu packet(s)"), dropped, total);
 

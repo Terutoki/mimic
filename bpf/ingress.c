@@ -222,7 +222,8 @@ int ingress_handler(struct xdp_md* xdp) {
 
   if (unlikely(!conn)) {
     if (!tcp->syn || tcp->ack) {
-      send_ctrl_packet(&conn_key, TCP_FLAG_RST, htonl(tcp->ack_seq), 0, 0);
+      if (rst_rate_ok(tstamp))
+        send_ctrl_packet(&conn_key, TCP_FLAG_RST, htonl(tcp->ack_seq), 0, 0);
       return XDP_DROP;
     }
     struct connection conn_value = conn_init(settings, tstamp);
@@ -242,7 +243,8 @@ int ingress_handler(struct xdp_md* xdp) {
     if (!settings) return XDP_PASS;
     if (unlikely(tcp->rst || tcp->fin)) return XDP_DROP;
     if (!tcp->syn || tcp->ack) {
-      send_ctrl_packet(&conn_key, TCP_FLAG_RST, htonl(tcp->ack_seq), 0, 0);
+      if (rst_rate_ok(tstamp))
+        send_ctrl_packet(&conn_key, TCP_FLAG_RST, htonl(tcp->ack_seq), 0, 0);
       return XDP_DROP;
     }
     struct connection conn_value = conn_init(settings, tstamp);
@@ -277,7 +279,14 @@ int ingress_handler(struct xdp_md* xdp) {
 
   __be32 flags = 0;
   __u32 seq = 0, ack_seq = 0, cooldown = 0;
-  __u32 random = bpf_get_prandom_u32();
+  // Unlocked heuristic read (mirrors the egress fast path): only new
+  // connections and established data segments need entropy. A stale
+  // prediction wastes one helper call at worst; decisions happen under the
+  // lock below, and helpers may not be called while it is held.
+  __u32 random =
+    (conn->state != CONN_ESTABLISHED || payload_len >= 2 || tcp->psh)
+      ? bpf_get_prandom_u32()
+      : 0;
 
   bpf_spin_lock(&conn->lock);
 
@@ -297,7 +306,9 @@ int ingress_handler(struct xdp_md* xdp) {
         conn->state = CONN_SYN_RECV;
         conn->initiator = false;
         flags |= TCP_FLAG_SYN | TCP_FLAG_ACK;
-        seq = conn->seq = random;
+        // random may be 0 if a userspace reset flipped this conn to IDLE
+        // after the heuristic above saw ESTABLISHED; fall back to tstamp.
+        seq = conn->seq = random ? random : (__u32)tstamp;
         ack_seq = conn->ack_seq = next_ack_seq(tcp, payload_len);
         conn->seq += 1;
         conn->peer_mss = opt.mss;
@@ -384,7 +395,10 @@ int ingress_handler(struct xdp_md* xdp) {
         conn->ack_seq = next_ack_seq(tcp, payload_len);
         __u32 upper_bound = DEFAULT_WINDOW / 2;
         __u32 lower_bound = DEFAULT_WINDOW / 4;
-        if (random % (upper_bound - lower_bound) + lower_bound >= conn->window) {
+        // Multiply-shift instead of modulo: constant-free idiv costs
+        // ~20-40 cycles/packet on the hot path.
+        __u32 pick = (__u32)(((__u64)random * (__u32)(upper_bound - lower_bound)) >> 32);
+        if (pick + lower_bound >= conn->window) {
           will_send_ctrl_packet = true;
           flags |= TCP_FLAG_ACK;
           seq = conn->seq;
@@ -410,7 +424,7 @@ int ingress_handler(struct xdp_md* xdp) {
   bpf_spin_unlock(&conn->lock);
 
   if (flags & TCP_FLAG_SYN && flags & TCP_FLAG_ACK) log_conn(LOG_CONN_ACCEPT, &conn_key);
-  if (will_send_ctrl_packet) {
+  if (will_send_ctrl_packet && (!(flags & TCP_FLAG_RST) || rst_rate_ok(tstamp))) {
     if (flags & TCP_FLAG_RST) window = 0;
     send_ctrl_packet(&conn_key, flags, seq, ack_seq, window);
   }

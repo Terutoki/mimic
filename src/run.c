@@ -5,7 +5,6 @@
 #include <bpf/libbpf.h>
 #include <errno.h>
 #include <fcntl.h>
-#include <ffi.h>
 #include <linux/bpf.h>
 #include <linux/if_link.h>
 #include <linux/tcp.h>
@@ -138,20 +137,14 @@ static inline int tc_hook_create_attach(struct bpf_tc_hook* hook, struct bpf_tc_
 
 // This function is somewhat heavy (see comments below), and is called often. Probably does
 // not really matter since this is not performance-critical either.
-static int handle_send_ctrl_packet(struct send_options* s, const char* ifname) {
-  // We don't store raw socket because if we do, kernel will forward all TCP traffic to it.
-  //
-  // Maybe setting reception buffer size to 0 will help, but it's just prevent packets from storing
-  // and they will be forwarded to the socket and discarded anyway.
-  int sk raii(closep) =
-    try_e(socket(ip_proto(&s->conn.local), SOCK_RAW | SOCK_NONBLOCK, IPPROTO_TCP));
-
-  int level = SOL_IP, opt = IP_FREEBIND, yes = 1;
-  if (ip_proto(&s->conn.local) == AF_INET6) {
-    level = SOL_IPV6;
-    opt = IPV6_FREEBIND;
-  }
-  try_e(setsockopt(sk, level, opt, &yes, sizeof(yes)), _("failed to set IP free bind: %s"), strret);
+//
+// The raw socket is reused across one event batch via `cache` (bound to the same
+// local address), instead of being re-created per control packet.
+static int handle_send_ctrl_packet(struct send_options* s, const char* ifname,
+                                   struct raw_sock_cache* cache) {
+  int family = ip_proto(&s->conn.local);
+  int sk = raw_sock_get(cache, family, IPPROTO_TCP, &s->conn.local);
+  if (sk < 0) return sk;
 
   struct sockaddr_storage saddr, daddr;
   conn_tuple_to_addrs(&s->conn, &saddr, &daddr);
@@ -161,8 +154,6 @@ static int handle_send_ctrl_packet(struct send_options* s, const char* ifname) {
     csum += ntohs(s->conn.local.s6_addr16[i]);
     csum += ntohs(s->conn.remote.s6_addr16[i]);
   }
-
-  try_e(bind(sk, (struct sockaddr*)&saddr, sizeof(saddr)), _("failed to bind: %s"), strret);
 
   __u32 flags = s->flags & TCP_FLAGS_MASK;
   bool syn = s->flags & TCP_FLAG_SYN;
@@ -225,7 +216,8 @@ static int handle_send_ctrl_packet(struct send_options* s, const char* ifname) {
 }
 
 static inline int send_ctrl_packet(struct conn_tuple* conn, __be32 flags, __u32 seq, __u32 ack_seq,
-                                   __u32 window, const char* ifname) {
+                                   __u32 window, const char* ifname,
+                                   struct raw_sock_cache* cache) {
   struct send_options s = {
     .conn = *conn,
     .flags = flags,
@@ -233,7 +225,7 @@ static inline int send_ctrl_packet(struct conn_tuple* conn, __be32 flags, __u32 
     .ack_seq = ack_seq,
     .window = window,
   };
-  return handle_send_ctrl_packet(&s, ifname);
+  return handle_send_ctrl_packet(&s, ifname, cache);
 }
 
 static int store_packet(struct bpf_map* conns, struct conn_tuple* conn_key, const char* data,
@@ -264,9 +256,14 @@ cleanup:
   return retcode;
 }
 
-static int _handle_rb_event(struct bpf_map* conns, const char* ifname, void* ctx, void* data,
-                            size_t data_sz) {
-  UNUSED(ctx);
+struct handle_rb_event_ctx {
+  struct bpf_map* conns;
+  const char* ifname;
+  struct raw_sock_cache* sk_cache;
+};
+
+static int _handle_rb_event(struct handle_rb_event_ctx* ectx, void* data, size_t data_sz) {
+  UNUSED(data_sz);
   struct rb_item* item = data;
   struct conn_tuple* conn = &item->store_packet.conn_key;
   const char* name;
@@ -279,19 +276,20 @@ static int _handle_rb_event(struct bpf_map* conns, const char* ifname, void* ctx
       break;
     case RB_ITEM_SEND_OPTIONS:
       name = N_("sending control packets");
-      ret = handle_send_ctrl_packet(&item->send_options, ifname);
+      ret = handle_send_ctrl_packet(&item->send_options, ectx->ifname, ectx->sk_cache);
       break;
     case RB_ITEM_STORE_PACKET:
       name = N_("storing packet");
       log_conn(LOG_DEBUG, conn, _("userspace received packet, udp.len=%u, csum_partial=%d"),
                item->store_packet.len, item->store_packet.l4_csum_partial);
       if (item->store_packet.len > data_sz - sizeof(*item)) break;
-      ret = store_packet(conns, conn, (char*)(item + 1), item->store_packet.len,
+      ret = store_packet(ectx->conns, conn, (char*)(item + 1), item->store_packet.len,
                          item->store_packet.l4_csum_partial);
       break;
     case RB_ITEM_CONSUME_PKTBUF:
       name = N_("consuming packet buffer");
-      ret = packet_buf_consume((struct packet_buf*)(uintptr_t)item->pktbuf, &consumed);
+      ret = packet_buf_consume((struct packet_buf*)(uintptr_t)item->pktbuf,
+                               ectx->sk_cache, &consumed);
       if (!consumed) packet_buf_free((struct packet_buf*)(uintptr_t)item->pktbuf);
       if (ret < 0) {
         log_debug(_("error %s: %s"), gettext(name), strerror(-ret));
@@ -311,38 +309,12 @@ static int _handle_rb_event(struct bpf_map* conns, const char* ifname, void* ctx
   return 0;
 }
 
-static ffi_type* _handle_rb_event_args[] = {
-  &ffi_type_pointer,
-  &ffi_type_pointer,
-  sizeof(void*) == 8 ? &ffi_type_uint64 : &ffi_type_uint32,
-};
-
-struct handle_rb_event_ctx {
-  struct bpf_map* conns;
-  const char* ifname;
-};
-
-static void _handle_rb_event_binding(ffi_cif* cif, void* ret, void** args, void* _ctx) {
-  UNUSED(cif);
-  struct handle_rb_event_ctx* ctx = (typeof(ctx))_ctx;
-  *(int*)ret = _handle_rb_event(ctx->conns, ctx->ifname, *(void**)args[0], *(void**)args[1],
-                                *(size_t*)args[2]);
-}
-
-static ring_buffer_sample_fn handle_rb_event(struct handle_rb_event_ctx* ctx, ffi_cif* cif,
-                                             ffi_closure** closure) {
-  ring_buffer_sample_fn fn;
-  *closure = ffi_closure_alloc(sizeof(ffi_closure), (void**)&fn);
-  if (!closure) return NULL;
-  if (ffi_prep_cif(cif, FFI_DEFAULT_ABI, 3, &ffi_type_sint, _handle_rb_event_args) != FFI_OK ||
-      ffi_prep_closure_loc(*closure, cif, _handle_rb_event_binding, ctx, fn) != FFI_OK) {
-    return NULL;
-  }
-  return fn;
+static int handle_rb_sample(void* _ctx, void* data, size_t data_sz) {
+  return _handle_rb_event(_ctx, data, data_sz);
 }
 
 // Retry, keepalive, cleanup
-static int do_routine(int conns_fd, const char* ifname) {
+static int do_routine(int conns_fd, const char* ifname, struct raw_sock_cache* sk_cache) {
   struct _conn_to_free {
     struct conn_tuple key;
     struct packet_buf* buf;
@@ -390,7 +362,7 @@ static int do_routine(int conns_fd, const char* ifname) {
           } else if (retry_secs != 0 && retry_secs % conn->settings.handshake.interval == 0) {
             log_conn(LOG_INFO, key, _("retry sending SYN"));
             send_ctrl_packet(key, TCP_FLAG_SYN | conn_max_window(conn), conn->seq - 1, 0,
-                             conn->window, ifname);
+                             conn->window, ifname, sk_cache);
           }
           break;
         case CONN_SYN_RECV:
@@ -409,7 +381,7 @@ static int do_routine(int conns_fd, const char* ifname) {
               conn->reset_tstamp = tstamp;
               conn->keepalive_sent = true;
               send_ctrl_packet(key, TCP_FLAG_ACK | conn_max_window(conn), conn->seq - 1,
-                               conn->ack_seq, conn->window, ifname);
+                               conn->ack_seq, conn->window, ifname, sk_cache);
               bpf_map_update_elem(conns_fd, key, conn, BPF_EXIST | BPF_F_LOCK);
             } else {
               int reset_secs = time_diff(SECOND, tstamp, conn->reset_tstamp);
@@ -418,7 +390,7 @@ static int do_routine(int conns_fd, const char* ifname) {
               } else if (reset_secs % conn->settings.keepalive.interval == 0) {
                 log_conn(LOG_DEBUG, key, _("sending keepalive"));
                 send_ctrl_packet(key, TCP_FLAG_ACK | conn_max_window(conn), conn->seq - 1,
-                                 conn->ack_seq, conn->window, ifname);
+                                 conn->ack_seq, conn->window, ifname, sk_cache);
               }
             }
           }
@@ -435,7 +407,7 @@ static int do_routine(int conns_fd, const char* ifname) {
           packet_buf_free(orig_pktbuf);
         }
         log_destroy(LOG_WARN, key, DESTROY_TIMED_OUT, conn_cooldown_display(conn));
-        send_ctrl_packet(key, TCP_FLAG_RST, conn->seq, 0, 0, ifname);
+        send_ctrl_packet(key, TCP_FLAG_RST, conn->seq, 0, 0, ifname, sk_cache);
       }
       if (remove) {
         struct _conn_to_free* item = malloc(sizeof(*item));
@@ -486,7 +458,8 @@ static inline bool is_kmod_loaded() {
   return false;
 }
 
-static inline int terminate_all_conns(int mimic_conns_fd, const char* ifname) {
+static inline int terminate_all_conns(int mimic_conns_fd, const char* ifname,
+                                      struct raw_sock_cache* sk_cache) {
   if (mimic_conns_fd < 0) return 0;
   struct conn_tuple key;
   struct connection conn;
@@ -494,8 +467,10 @@ static inline int terminate_all_conns(int mimic_conns_fd, const char* ifname) {
   while (try(bpf_map_iter_next(&iter, &key))) {
     try(bpf_map_lookup_elem_flags(mimic_conns_fd, &key, &conn, BPF_F_LOCK),
         _("failed to get value from map '%s': %s"), "mimic_conns", strret);
-    if (conn.state != CONN_IDLE) send_ctrl_packet(&key, TCP_FLAG_RST, 0, 0, 0, ifname);
+    if (conn.state != CONN_IDLE)
+      send_ctrl_packet(&key, TCP_FLAG_RST, 0, 0, 0, ifname, sk_cache);
   }
+  raw_sock_flush(sk_cache);
   return 0;
 }
 
@@ -527,8 +502,8 @@ static inline int run_bpf(struct run_args* args, int lock_fd, const char* ifname
 #endif
 
   struct ring_buffer* rb = NULL;
-  ffi_closure* closure = NULL;
-  ffi_cif cif;
+  struct raw_sock_cache sk_cache;
+  raw_sock_cache_init(&sk_cache);
 
   skel = try2_p(mimic_bpf__open(), _("failed to open BPF program: %s"), strret);
 
@@ -594,8 +569,12 @@ static inline int run_bpf(struct run_args* args, int lock_fd, const char* ifname
   struct bpf_map_info map_info = {};
   __u32 prog_len = sizeof(prog_info), map_len = sizeof(map_info);
   _get_map_id(mimic_rb);
-  struct handle_rb_event_ctx ctx = {.conns = skel->maps.mimic_conns, .ifname = ifname};
-  rb = try2_p(ring_buffer__new(mimic_rb_fd, handle_rb_event(&ctx, &cif, &closure), NULL, NULL),
+  struct handle_rb_event_ctx ctx = {
+    .conns = skel->maps.mimic_conns,
+    .ifname = ifname,
+    .sk_cache = &sk_cache,
+  };
+  rb = try2_p(ring_buffer__new(mimic_rb_fd, handle_rb_sample, &ctx, NULL),
               _("failed to attach BPF ring buffer '%s': %s"), "mimic_rb", strret);
 
   // Save state to lock file
@@ -705,7 +684,7 @@ static inline int run_bpf(struct run_args* args, int lock_fd, const char* ifname
       } else if (events[i].data.fd == timer) {
         __u64 expirations;
         read(timer, &expirations, sizeof(expirations));
-        retcode = do_routine(mimic_conns_fd, ifname);
+        retcode = do_routine(mimic_conns_fd, ifname, &sk_cache);
 
       } else if (args->wildcard_count > 0 && events[i].data.fd == rtnl) {
         struct ip_delta_list* ips raii(ip_delta_list_destroy) = NULL;
@@ -719,11 +698,15 @@ static inline int run_bpf(struct run_args* args, int lock_fd, const char* ifname
         cleanup(-1, _("unknown fd: %d"), events[i].data.fd);
       }
     }
+
+    // Control sockets are only kept for the duration of one event batch, so
+    // kernel does not mirror ongoing TCP/UDP traffic to them between bursts.
+    raw_sock_flush(&sk_cache);
   }
 
   retcode = 0;
 cleanup:
-  terminate_all_conns(mimic_conns_fd, ifname);
+  terminate_all_conns(mimic_conns_fd, ifname, &sk_cache);
   sigprocmask(SIG_SETMASK, NULL, NULL);
   if (tc_hook_created) tc_hook_cleanup(&tc_hook_egress, &tc_opts_egress);
 #ifdef MIMIC_USE_LIBXDP
@@ -735,8 +718,8 @@ cleanup:
   {
     if (xdp_attached) bpf_xdp_detach(ifindex, args->xdp_mode, NULL);
   }
+  raw_sock_flush(&sk_cache);
   if (rb) ring_buffer__free(rb);
-  if (closure) ffi_closure_free(closure);
   if (skel) mimic_bpf__destroy(skel);
   return retcode;
 }

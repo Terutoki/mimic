@@ -7,7 +7,7 @@ mimic_bpf_headers := bpf/vmlinux.h $(wildcard bpf/*.h) $(mimic_common_headers)
 mimic_src := $(wildcard src/*.c)
 mimic_obj := $(mimic_src:.c=.o)
 mimic_headers := src/bpf_skel.h $(wildcard src/*.h) $(mimic_common_headers)
-mimic_link_libs := -lbpf -lffi
+mimic_link_libs := -lbpf
 
 mimic_tools := $(patsubst tools/%.c,%,$(wildcard tools/*.c))
 
@@ -29,7 +29,8 @@ CFLAGS += -iquote. -Wall -Wextra -std=gnu99
 MODE ?=
 ifeq ($(MODE), debug)
 CFLAGS += -O0 -g
-else ifeq ($(MODE), release)
+else
+# Default to optimized builds; `MODE=` no longer means unoptimized
 CFLAGS += -O2
 endif
 
