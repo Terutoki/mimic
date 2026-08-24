@@ -23,15 +23,15 @@ include $(INCLUDE_DIR)/package.mk
 define Package/mimic
 	SECTION := net
 	CATEGORY := Network
-	TITLE := eBPF TCP -> UDP Obfuscator
-	URL := https://github.com/hack3ric/mimic
-	DEPENDS := +libbpf +libffi +kmod-sched-core +kmod-sched-bpf
+	TITLE := eBPF UDP -> TCP Obfuscator
+	URL := https://github.com/Terutoki/mimic
+	DEPENDS := +libbpf +kmod-sched-core +kmod-sched-bpf
 endef
 
 define Package/mimic/description
-  Mimic is a lightweight eBPF-based tool that obfuscates UDP traffic
-  (e.g. WireGuard) as TCP by transparently rewriting packet headers at
-  TC/XDP hooks. This fork adds the anti_gro setting.
+Mimic is an eBPF-based UDP-to-TCP obfuscator. It rewrites selected
+UDP packets as TCP at TC egress and restores reply packets to UDP
+at XDP ingress. This fork adds the anti_gro setting.
 endef
 
 define KernelPackage/mimic
@@ -47,21 +47,13 @@ define KernelPackage/mimic/description
   checksum hacks, and Mimic works without the kernel module.
 endef
 
-mimic_compat_flags :=
-ifneq ($(findstring 6.1.,$(LINUX_VERSION)),)
-  mimic_compat_flags := COMPAT_LINUX_6_1=1
-else ifneq ($(findstring 6.6.,$(LINUX_VERSION)),)
-  mimic_compat_flags := COMPAT_LINUX_6_6=1
-endif
-
 mimic_kmod_flags := \
 	KERNEL_DIR="$(LINUX_DIR)" \
 	ARCH="$(LINUX_KARCH)" \
 	CROSS_COMPILE="$(TARGET_CROSS)" \
 	M="$(PKG_BUILD_DIR)/kmod" \
 	V="$(V)" \
-	CHECKSUM_HACK=kprobe \
-	$(mimic_compat_flags)
+	CHECKSUM_HACK=kprobe
 
 mimic_cli_flags := \
 	MODE=release \
@@ -72,7 +64,6 @@ mimic_cli_flags := \
 	ARGP_STANDALONE=1 \
 	CHECKSUM_HACK=kprobe \
 	RUNTIME_DIR=/var/run/mimic \
-	$(mimic_compat_flags) \
     STRIP_BTF_EXT=1 \
 	USE_LIBXDP=0
 
