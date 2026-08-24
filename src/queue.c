@@ -45,7 +45,7 @@ struct queue_node* queue_pop(struct queue* q) {
 
 void queue_node_free(struct queue_node* node) {
   if (!node) return;
-  node->data_free(node->data);
+  if (node->data_free) node->data_free(node->data);
   free(node);
 }
 
@@ -55,21 +55,9 @@ void queue_free(struct queue* q) {
   q->head = q->tail = NULL;
 }
 
-static inline struct packet* packet_new(const char* data, size_t len, bool l4_csum_partial) {
-  struct packet* result = malloc(sizeof(*result) + len);
-  if (!result) return NULL;
-  result->len = len;
-  memcpy(result->data, data, len);
-  if (l4_csum_partial) {
-    __u32 csum = calc_csum(result->data, len);
-    *(__be16*)(result->data + offsetof(struct udphdr, check)) = htons(csum_fold(csum));
-  }
-  return result;
+static inline struct packet* _packet_of(struct queue_node* node) {
+  return (struct packet*)((char*)node + sizeof(*node));
 }
-
-static inline void packet_free(struct packet* p) { free(p); }
-
-static inline void _packet_free_void(void* p) { packet_free(p); }
 
 static int raw_sock_idx(int family, int proto) {
   return (family == AF_INET6 ? 1 : 0) + (proto == IPPROTO_UDP ? 2 : 0);
@@ -131,8 +119,25 @@ struct packet_buf* packet_buf_new(struct conn_tuple* conn) {
 
 int packet_buf_push(struct packet_buf* buf, const char* data, size_t len, bool l4_csum_partial) {
   if (buf->size + len > MAX_PACKET_BUF_SIZE) return 0;  // drop new packets once buffer is full
-  struct packet* pkt = try_p(packet_new(data, len, l4_csum_partial));
-  queue_push(&buf->queue, pkt, _packet_free_void);
+  struct queue_node* node = malloc(sizeof(*node) + sizeof(struct packet) + len);
+  if (!node) return -ENOMEM;
+  node->next = NULL;
+  node->data = _packet_of(node);
+  node->data_free = NULL;  // payload shares the node's block
+  struct packet* pkt = node->data;
+  pkt->len = len;
+  memcpy(pkt->data, data, len);
+  if (l4_csum_partial) {
+    __u32 csum = calc_csum(pkt->data, len);
+    *(__be16*)(pkt->data + offsetof(struct udphdr, check)) = htons(csum_fold(csum));
+  }
+  if (buf->queue.head) {
+    buf->queue.tail->next = node;
+    buf->queue.tail = node;
+  } else {
+    buf->queue.head = buf->queue.tail = node;
+  }
+  buf->queue.len++;
   buf->size += len;
   return 0;
 }

@@ -260,16 +260,20 @@ int egress_handler(struct __sk_buff* skb) {
   redecl_shot(struct tcphdr, tcp, ip_end, skb);
   log_tcp(false, &conn_key, tcp, payload_len);
 
+  // Chain header-swap and pseudo-header deltas into one seed and patch the
+  // field with a single helper call instead of two. PSEUDO_HDR preserves the
+  // CHECKSUM_PARTIAL field-patching of the old second call; for non-partial
+  // skbs the folded field result is identical (deltas are linear).
   tcp->check = 0;
   csum_diff =
     bpf_csum_diff((__be32*)&old_udp, sizeof(old_udp), (__be32*)tcp, sizeof(*tcp), csum_diff);
   tcp->check = old_udp_csum;
-  bpf_l4_csum_replace(skb, csum_off, 0, csum_diff, 0);
 
   __be16 new_len = htons(udp_len + reserve_len);
   struct ph_part old_ph = {.protocol = IPPROTO_UDP, .len = old_udp.len};
   struct ph_part new_ph = {.protocol = IPPROTO_TCP, .len = new_len};
-  csum_diff = bpf_csum_diff((__be32*)&old_ph, sizeof(old_ph), (__be32*)&new_ph, sizeof(new_ph), 0);
+  csum_diff = bpf_csum_diff((__be32*)&old_ph, sizeof(old_ph), (__be32*)&new_ph, sizeof(new_ph),
+                            csum_diff);
   bpf_l4_csum_replace(skb, csum_off, 0, csum_diff, BPF_F_PSEUDO_HDR);
 
   mimic_change_csum_offset(skb, IPPROTO_TCP);

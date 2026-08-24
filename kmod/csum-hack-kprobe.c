@@ -48,12 +48,19 @@ static int bpf_skb_change_type_ret_handler(struct kretprobe_instance* ri, struct
 }
 NOKPROBE_SYMBOL(bpf_skb_change_type_ret_handler);
 
+// kretprobe instances are per-CPU pooled with a shared overflow list; when all
+// `maxactive` slots are in flight the handler is skipped and the helper returns
+// -EINVAL, which the datapath treats as packet drop. 32 slots exhausted under
+// burst load; these probes fire system-wide so size generously (instances are
+// tiny and freed on return).
+#define MIMIC_KRETPROBE_MAXACTIVE 1024
+
 static struct kretprobe bpf_skb_change_type_probe = {
   .kp.symbol_name = "bpf_skb_change_type",
   .entry_handler = bpf_skb_change_type_entry_handler,
   .handler = bpf_skb_change_type_ret_handler,
   .data_size = sizeof(struct bpf_skb_change_type_params),
-  .maxactive = 32,
+  .maxactive = MIMIC_KRETPROBE_MAXACTIVE,
 };
 
 struct bpf_skb_change_proto_params {
@@ -125,7 +132,7 @@ static struct kretprobe bpf_skb_change_proto_probe = {
   .entry_handler = bpf_skb_change_proto_entry_handler,
   .handler = bpf_skb_change_proto_ret_handler,
   .data_size = sizeof(struct bpf_skb_change_proto_params),
-  .maxactive = 32,
+  .maxactive = MIMIC_KRETPROBE_MAXACTIVE,
 };
 
 static struct kretprobe* mimic_probes[] = {

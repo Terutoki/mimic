@@ -17,14 +17,29 @@ static inline __u32 u32_fold(__u32 num) { return (num & 0xffff) + (num >> 16); }
 static inline __u16 csum_fold(__u32 csum) { return ~u32_fold(u32_fold(csum)); }
 
 static inline __u32 calc_csum(void* data, size_t data_len) {
-  __u32 result = 0;
-  for (size_t i = 0; i < data_len / 2; i++) {
-    result += ntohs(*((__u16*)data + i));
+  // Sum 32-bit big-endian words instead of 16-bit: identical checksum residue
+  // class (callers still apply the single final csum_fold), one load+bswap per
+  // step. A 64-bit accumulator is required: MAX_PACKET_SIZE worth of full
+  // 32-bit words overflows u32 before folding.
+  __u64 result = 0;
+  const __u8* p = (const __u8*)data;
+  size_t n = data_len & ~(size_t)3;
+  for (size_t i = 0; i < n; i += 4) {
+    __u32 w;
+    __builtin_memcpy(&w, p + i, sizeof(w));
+    result += __builtin_bswap32(w);
   }
-  if (data_len % 2 == 1) {
-    result += (__u16)((__u8*)data)[data_len - 1] << 8;
+  switch (data_len & 3) {
+    case 1: result += (__u32)p[n] << 8; break;
+    case 2: result += ((__u32)p[n] << 8) | p[n + 1]; break;
+    case 3:
+      result += ((__u32)p[n] << 8) | p[n + 1];
+      result += (__u32)p[n + 2] << 8;
+      break;
+    default: break;
   }
-  return result;
+  __u32 r = (__u32)(result & 0xffffffff) + (__u32)(result >> 32);
+  return u32_fold(u32_fold(r));
 }
 
 #endif  // MIMIC_COMMON_CHECKSUM_H

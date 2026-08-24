@@ -232,6 +232,7 @@ static int store_packet(struct bpf_map* conns, struct conn_tuple* conn_key, cons
                         __u16 len, bool l4_csum_partial) {
   int retcode;
   struct connection conn = {};
+  __u64 ours = 0;
   try2(bpf_map__lookup_elem(conns, conn_key, sizeof(*conn_key), &conn, sizeof(conn), BPF_F_LOCK));
 
   if (conn.state != CONN_SYN_SENT && conn.state != CONN_SYN_RECV) {
@@ -241,10 +242,31 @@ static int store_packet(struct bpf_map* conns, struct conn_tuple* conn_key, cons
     return 0;
   }
 
-  if (!conn.pktbuf) conn.pktbuf = (__u64)(uintptr_t)try2_p(packet_buf_new(conn_key));
-  try2_e(packet_buf_push((struct packet_buf*)(uintptr_t)conn.pktbuf, data, len, l4_csum_partial));
-  try2(bpf_map__update_elem(conns, conn_key, sizeof(*conn_key), &conn, sizeof(conn),
-                            BPF_EXIST | BPF_F_LOCK));
+  bool created = false;
+  if (!conn.pktbuf) {
+    conn.pktbuf = (__u64)(uintptr_t)try2_p(packet_buf_new(conn_key));
+    ours = conn.pktbuf;
+    created = true;
+  } else {
+    ours = conn.pktbuf;
+  }
+  try2_e(packet_buf_push((struct packet_buf*)(uintptr_t)ours, data, len, l4_csum_partial));
+
+  // Persist only a freshly created buffer, and only if the row still shows a
+  // handshaking state with an empty buffer. Writing back the whole snapshot
+  // unconditionally would republish a swapped-out pointer or regress the
+  // kernel's connection state (both lead to double frees / dead streams).
+  if (created) {
+    struct connection cur = {};
+    try2(bpf_map__lookup_elem(conns, conn_key, sizeof(*conn_key), &cur, sizeof(cur), BPF_F_LOCK));
+    if (cur.pktbuf != 0 || (cur.state != CONN_SYN_SENT && cur.state != CONN_SYN_RECV)) {
+      // kernel swapped the buffer out meanwhile; our pushed packet rides in
+      // the consume event, nothing to persist
+      return 0;
+    }
+    try2(bpf_map__update_elem(conns, conn_key, sizeof(*conn_key), &conn, sizeof(conn),
+                              BPF_EXIST | BPF_F_LOCK));
+  }
   return 0;
 cleanup:
   if (retcode == -ENOENT) {
@@ -252,7 +274,10 @@ cleanup:
              _("connection released when attempting to store packet; freeing packet buffer"));
     retcode = 0;
   }
-  if (conn.pktbuf) packet_buf_free((struct packet_buf*)(uintptr_t)conn.pktbuf);
+  // Free only a buffer we still own; once the kernel swapped it out
+  // (cur.pktbuf != ours), the ringbuf consume/free event owns it.
+  if (ours && (!conn.pktbuf || conn.pktbuf == ours))
+    packet_buf_free((struct packet_buf*)(uintptr_t)ours);
   return retcode;
 }
 
@@ -398,23 +423,37 @@ static int do_routine(int conns_fd, const char* ifname, struct raw_sock_cache* s
         default: break;
       }
 
-      if (reset) {
-        if (!remove) {
-          struct packet_buf* orig_pktbuf = (typeof(orig_pktbuf))(uintptr_t)conn->pktbuf;
-          conn->pktbuf = 0;
-          conn_reset(conn, tstamp);
-          bpf_map_update_elem(conns_fd, key, conn, BPF_EXIST | BPF_F_LOCK);
-          packet_buf_free(orig_pktbuf);
+      if (reset || remove) {
+        // Re-read under the bucket lock: our batch snapshot may predate a
+        // kernel-side pktbuf swap (connection established). Clearing/freeing
+        // the fresh value is what keeps buffer ownership single.
+        struct connection cur;
+        if (bpf_map_lookup_elem_flags(conns_fd, key, &cur, BPF_F_LOCK) < 0) continue;
+        __u64 pb = cur.pktbuf;
+        if (reset) {
+          cur.pktbuf = 0;
+          conn_reset(&cur, tstamp);
+        } else {
+          log_conn(LOG_DEBUG, key, _("connection removed"));
         }
-        log_destroy(LOG_WARN, key, DESTROY_TIMED_OUT, conn_cooldown_display(conn));
-        send_ctrl_packet(key, TCP_FLAG_RST, conn->seq, 0, 0, ifname, sk_cache);
-      }
-      if (remove) {
-        struct _conn_to_free* item = malloc(sizeof(*item));
-        item->key = *key;
-        item->buf = (struct packet_buf*)(uintptr_t)conn->pktbuf;
-        queue_push(&free_queue, item, free);
-        log_conn(LOG_DEBUG, key, _("connection removed"));
+        if (remove) {
+          struct _conn_to_free* item = malloc(sizeof(*item));
+          if (item) {
+            item->key = *key;
+            item->buf = (struct packet_buf*)(uintptr_t)pb;
+            queue_push(&free_queue, item, free);
+          } else if (pb) {
+            packet_buf_free((struct packet_buf*)(uintptr_t)pb);
+          }
+          bpf_map_delete_elem(conns_fd, key);
+        } else if (bpf_map_update_elem(conns_fd, key, &cur, BPF_EXIST | BPF_F_LOCK) == 0) {
+          // update succeeded: we own whatever the row referenced
+          if (pb) packet_buf_free((struct packet_buf*)(uintptr_t)pb);
+        }
+        if (reset) {
+          log_destroy(LOG_WARN, key, DESTROY_TIMED_OUT, conn_cooldown_display(&cur));
+          send_ctrl_packet(key, TCP_FLAG_RST, cur.seq, 0, 0, ifname, sk_cache);
+        }
       }
     }
     if (err < 0 || count == 0) break;

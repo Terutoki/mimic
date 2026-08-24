@@ -10,21 +10,26 @@
 extern int log_verbosity;
 extern enum link_type link_type;
 
+extern struct mimic_conns_map {
+  __uint(type, BPF_MAP_TYPE_HASH);
+  __uint(max_entries, 65536);
+  // Preallocated: this is the per-packet hot lookup. Prealloc keeps entries in
+  // one contiguous arena (no per-entry kmalloc + hlist pointer chasing) and
+  // costs ~7MB of reserved memory worst case.
+  __type(key, struct conn_tuple);
+  __type(value, struct connection);
+} mimic_conns;
+
 extern struct mimic_whitelist_map {
   __uint(type, BPF_MAP_TYPE_HASH);
   __uint(max_entries, 65536);
+  // NO_PREALLOC on purpose: real whitelist sizes are tiny while the capacity
+  // bound is huge; preallocating would pin ~10MB for a handful of entries.
+  // Lookups only happen for unknown flows.
   __uint(map_flags, BPF_F_NO_PREALLOC);
   __type(key, struct filter);
   __type(value, struct filter_info);
 } mimic_whitelist;
-
-extern struct mimic_conns_map {
-  __uint(type, BPF_MAP_TYPE_HASH);
-  __uint(max_entries, 65536);
-  __uint(map_flags, BPF_F_NO_PREALLOC);
-  __type(key, struct conn_tuple);
-  __type(value, struct connection);
-} mimic_conns;
 
 extern struct mimic_rb_map {
   __uint(type, BPF_MAP_TYPE_RINGBUF);

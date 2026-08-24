@@ -102,6 +102,10 @@ struct packet {
   char data[];
 };
 
+// packet_buf_push allocates node and packet payload in ONE block:
+// [queue_node][packet header][data]; node.data_free stays NULL so
+// queue_node_free frees the whole block with the node itself.
+
 struct raw_sock_cache;
 
 struct packet_buf* packet_buf_new(struct conn_tuple* conn);
