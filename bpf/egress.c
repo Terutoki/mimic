@@ -103,22 +103,27 @@ int egress_handler(struct __sk_buff* skb) {
     default: return TC_ACT_SHOT;
   }
 
+  bool ipv6_frag = false;
   if (ipv4) {
     ip_end = l2_end + (ipv4->ihl << 2);
     ip_proto = ipv4->protocol;
+    // Rewriting one fragment of a fragmented datagram corrupts the whole
+    // reassembly; let those reach the wire untouched.
+    if (ipv4->frag_off & ~htons(IP_DF)) return TC_ACT_OK;
   } else if (ipv6) {
     ip_proto = ipv6->nexthdr;
     ip_end = l2_end + sizeof(*ipv6);
     struct ipv6_opt_hdr* opt = NULL;
     for (int i = 0; i < 8; i++) {
       if (!ipv6_is_ext(ip_proto)) break;
+      if (ip_proto == IPPROTO_FRAGMENT) ipv6_frag = true;
       redecl_shot(struct ipv6_opt_hdr, opt, ip_end, skb);
       ip_proto = opt->nexthdr;
       ip_end += (opt->hdrlen + 1) << 3;
     }
   }
 
-  if (ip_proto != IPPROTO_UDP) return TC_ACT_OK;
+  if (ip_proto != IPPROTO_UDP || ipv6_frag) return TC_ACT_OK;
   decl_ok(struct udphdr, udp, ip_end, skb);
 
   struct conn_tuple conn_key = gen_conn_key(QUARTET_UDP);

@@ -142,16 +142,21 @@ int ingress_handler(struct xdp_md* xdp) {
     default: return XDP_DROP;
   }
 
+  bool ipv6_frag = false;
   if (ipv4) {
     ip_end = l2_end + (ipv4->ihl << 2);
     ip_payload_len = ntohs(ipv4->tot_len) - (ipv4->ihl << 2);
     ip_proto = ipv4->protocol;
+    // Rewriting one fragment of a fragmented datagram corrupts the whole
+    // reassembly; let those reach the stack untouched.
+    if (ipv4->frag_off & ~htons(IP_DF)) return XDP_PASS;
   } else if (ipv6) {
     ip_proto = ipv6->nexthdr;
     ip_end = l2_end + sizeof(*ipv6);
     struct ipv6_opt_hdr* opt = NULL;
     for (int i = 0; i < 8; i++) {
       if (!ipv6_is_ext(ip_proto)) break;
+      if (ip_proto == IPPROTO_FRAGMENT) ipv6_frag = true;
       redecl_drop(struct ipv6_opt_hdr, opt, ip_end, xdp);
       ip_proto = opt->nexthdr;
       ip_end += (opt->hdrlen + 1) << 3;
@@ -159,7 +164,7 @@ int ingress_handler(struct xdp_md* xdp) {
     ip_payload_len = ntohs(ipv6->payload_len);
   }
 
-  if (ip_proto != IPPROTO_TCP) return XDP_PASS;
+  if (ip_proto != IPPROTO_TCP || ipv6_frag) return XDP_PASS;
   decl_pass(struct tcphdr, tcp, ip_end, xdp);
 
 #if defined(MIMIC_COMPAT_LINUX_6_1) || defined(MIMIC_COMPAT_LINUX_6_6)
@@ -181,7 +186,7 @@ int ingress_handler(struct xdp_md* xdp) {
   if (tcp->syn) try_xdp(read_tcp_options(xdp, tcp, ip_end, &opt));
 #else
   __u64 pktbuf = 0;
-  __u64 tstamp = bpf_ktime_get_boot_ns();
+  __u64 tstamp = 0;  // 0 = not fetched yet; fetched past the whitelist gate below
   struct tcp_options opt = {};
   // Unconditional: for non-SYN packets doff==5 -> len==0 -> immediate return, so
   // the call is free. Keeping it straight-line here stops clang from hoisting the
@@ -242,6 +247,7 @@ int ingress_handler(struct xdp_md* xdp) {
     struct filter_settings* settings = matches_whitelist(QUARTET_TCP);
     if (!settings) return XDP_PASS;
     if (unlikely(tcp->rst || tcp->fin)) return XDP_DROP;
+    tstamp = bpf_ktime_get_boot_ns();
     if (!tcp->syn || tcp->ack) {
       if (rst_rate_ok(tstamp))
         send_ctrl_packet(&conn_key, TCP_FLAG_RST, htonl(tcp->ack_seq), 0, 0);
@@ -251,6 +257,9 @@ int ingress_handler(struct xdp_md* xdp) {
     try_drop(bpf_map_update_elem(&mimic_conns, &conn_key, &conn_value, BPF_ANY));
     conn = try_p_drop(bpf_map_lookup_elem(&mimic_conns, &conn_key));
   }
+  // Foreign traffic exited above; only known-mimic flows pay the timestamp here.
+  if (!tstamp)
+    tstamp = bpf_ktime_get_boot_ns();
 
   // Quick path for RST and FIN
   if (unlikely(tcp->rst || tcp->fin)) {
@@ -466,14 +475,27 @@ int ingress_handler(struct xdp_md* xdp) {
   __u16 udp_len = ip_payload_len - reserve_len;
   udp->len = htons(udp_len);
 
-  udp->check = 0;
-  csum_diff = bpf_csum_diff((__be32*)&old_tcp, sizeof(old_tcp), (__be32*)udp, sizeof(*udp), 0);
-  csum += u32_fold(ntohl(csum_diff));
-
-  __be16 oldlen = htons(ip_payload_len);
-  struct ph_part old_ph = {.protocol = IPPROTO_TCP, .len = oldlen};
-  struct ph_part new_ph = {.protocol = IPPROTO_UDP, .len = udp->len};
-  csum_diff = bpf_csum_diff((__be32*)&old_ph, sizeof(old_ph), (__be32*)&new_ph, sizeof(new_ph), 0);
+  // Pack [tcphdr|pseudo-hdr] and [udphdr|pseudo-hdr] into contiguous stack blobs
+  // so header swap + pseudo-header swap ride ONE bpf_csum_diff call instead of
+  // two; operand multiset is byte-identical to the old pair (stack copies carry
+  // check=0; the skb check field is overwritten once with the folded result).
+  struct {
+    struct tcphdr tcp;
+    struct ph_part ph;
+  } old_blob = {
+    .tcp = old_tcp,
+    .ph = {.protocol = IPPROTO_TCP, .len = htons(ip_payload_len)},
+  };
+  struct {
+    struct udphdr udp;
+    struct ph_part ph;
+  } __attribute__((packed)) new_blob = {
+    .udp = *udp,
+    .ph = {.protocol = IPPROTO_UDP, .len = htons(udp_len)},
+  };
+  new_blob.udp.check = 0;
+  csum_diff =
+    bpf_csum_diff((__be32*)&old_blob, sizeof(old_blob), (__be32*)&new_blob, sizeof(new_blob), 0);
   csum += u32_fold(ntohl(csum_diff));
 
   udp->check = htons(csum_fold(csum));

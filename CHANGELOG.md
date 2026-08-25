@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- Pass IP fragments through untouched instead of rewriting them as if they
+  were whole datagrams, which corrupted reassembly (IPv4 MF/offset and
+  IPv6 fragment header are now detected on both TC egress and XDP ingress;
+  note the datapath still does not accelerate fragmented traffic)
+- Ingress: fold the TCP-header swap and pseudo-header swap checksum deltas
+  into a single `bpf_csum_diff` call per packet (mirror of the egress
+  optimization), replacing two helper calls
+- Ingress (kernels other than 6.1/6.6 compat builds): fetch the packet
+  timestamp only after the whitelist gate, so forwarded non-Mimic TCP no
+  longer pays one helper call per packet
 - Fix wildcard filters never following interface address changes: the netlink
   delta list was only applied after a failed recv (inverted condition)
 - Fix userspace packet-buffer leak when the kernel swaps a handshake buffer out

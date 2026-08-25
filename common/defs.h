@@ -113,10 +113,13 @@
 #define TC_ACT_REDIRECT 7
 
 // defined in linux/if_ether.h
-#define ETH_HLEN 14       /* Total octets in header. */
+#define ETH_HLEN 14       /* Total octets in a header. */
 #define ETH_DATA_LEN 1500 /* Max. octets in payload	*/
 #define ETH_P_IP 0x0800   /* Internet Protocol packet	*/
 #define ETH_P_IPV6 0x86DD /* IPv6 over bluebook	*/
+
+// defined in linux/ip.h
+#define IP_DF 0x4000 /* Do not fragment flag (already in network order usage) */
 
 // defined in linux/tcp.h
 #ifndef tcp_flag_word
