@@ -165,7 +165,10 @@ static int handle_send_ctrl_packet(struct send_options* s, const char* ifname,
   size_t buf_len = header_len + garbage_byte;
   csum += buf_len;
 
-  void* buf raii(freep) = malloc(buf_len);
+  // 20-byte header, 12 bytes of SYN options at most, one garbage byte: the
+  // largest control packet fits in this u32-aligned stack buffer, no
+  // allocator round-trip needed.
+  __u32 buf[(sizeof(struct tcphdr) + 3 * 4 + 1 + 3) / 4] = {};
   struct tcphdr* tcp = (typeof(tcp))buf;
   *tcp = (typeof(*tcp)){
     .source = htons(s->conn.local_port),
@@ -260,8 +263,9 @@ static int store_packet(struct bpf_map* conns, struct conn_tuple* conn_key, cons
     struct connection cur = {};
     try2(bpf_map__lookup_elem(conns, conn_key, sizeof(*conn_key), &cur, sizeof(cur), BPF_F_LOCK));
     if (cur.pktbuf != 0 || (cur.state != CONN_SYN_SENT && cur.state != CONN_SYN_RECV)) {
-      // kernel swapped the buffer out meanwhile; our pushed packet rides in
-      // the consume event, nothing to persist
+      // kernel swapped the buffer out meanwhile. `ours` was never published,
+      // so no consume/free event will ever reference it: free it here or leak.
+      packet_buf_free((struct packet_buf*)(uintptr_t)ours);
       return 0;
     }
     try2(bpf_map__update_elem(conns, conn_key, sizeof(*conn_key), &conn, sizeof(conn),
@@ -728,7 +732,9 @@ static inline int run_bpf(struct run_args* args, int lock_fd, const char* ifname
       } else if (args->wildcard_count > 0 && events[i].data.fd == rtnl) {
         struct ip_delta_list* ips raii(ip_delta_list_destroy) = NULL;
         retcode = rtnl_recv_addr_change(rtnl, ifindex, &ips);
-        if (retcode < 0) {
+        // Success populates `ips`; the recv already destroyed the list on
+        // failure, so applying there would be a no-op. Do not invert this.
+        if (retcode >= 0) {
           retcode =
             ip_delta_list_apply(ips, skel->maps.mimic_whitelist, wildcards, args->wildcard_count);
         }

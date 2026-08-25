@@ -35,15 +35,15 @@
   ({                    \
     typeof(x) _x = (x); \
     typeof(y) _y = (y); \
-    _x > _y - _x < _y;  \
+    (_x > _y) - (_x < _y); \
   })
 
 #define sizeof_array(arr) (sizeof(arr) / sizeof(arr[0]))
-#define round_to_mul(val, mul)                                \
-  ({                                                          \
-    typeof(val) _val = (val);                                 \
-    typeof(mul) _mul = (mul);                                 \
-    (_val % _mul == 0) ? _val : (_val + (_mul - _val % mul)); \
+#define round_to_mul(val, mul)                                 \
+  ({                                                           \
+    typeof(val) _val = (val);                                  \
+    typeof(mul) _mul = (mul);                                  \
+    (_val % _mul == 0) ? _val : (_val + (_mul - _val % _mul)); \
   })
 
 #define swap(x, y)   \
@@ -400,7 +400,11 @@ static __always_inline __u32 conn_padding(struct connection* conn, __u32 seq, __
   if (conn->settings.padding != PADDING_RANDOM) return (__u32)conn->settings.padding;
   // When anti_gro is on, the wire ack_seq is jittered per packet and isn't recoverable
   // by the receiver, so drop it from the entropy mix to keep padding symmetric.
-  return (seq + (conn->settings.anti_gro ? 0 : ack_seq)) % 11;
+  // Lemire multiply-shift range reduction to [0,10]: same deterministic spread
+  // as the old `% 11` without the ~20-40 cycle idiv on the per-packet path.
+  // NOTE: peers must run matching versions when padding=random is enabled.
+  __u32 entropy = seq ^ (conn->settings.anti_gro ? 0 : ack_seq);
+  return (__u32)(((__u64)entropy * 11) >> 32);
 }
 
 static __always_inline __be32 conn_max_window(struct connection* conn) {

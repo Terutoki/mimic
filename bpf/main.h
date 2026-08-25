@@ -138,7 +138,7 @@ int rst_rate_ok(__u64 now);
 #define _log_b_0() (__u64[0]){}, 0
 #define _log_b_1(_a) (__u64[1]){(__u64)(_a)}, sizeof(__u64)
 #define _log_b_2(_a, _b) (__u64[2]){(__u64)(_a), (__u64)(_b)}, 2 * sizeof(__u64)
-#define _log_b_3(_a, _b, _c) (__u64[2]){(__u64)(_a), (__u64)(_b), (__u64)(_c)}, 3 * sizeof(__u64)
+#define _log_b_3(_a, _b, _c) (__u64[3]){(__u64)(_a), (__u64)(_b), (__u64)(_c)}, 3 * sizeof(__u64)
 #define _log_c(...) _log_a(__VA_ARGS__, 3, 2, 1, 0)
 #define _log_d(_x, _y) _x##_y
 #define _log_e(_x, _y) _log_d(_x, _y)

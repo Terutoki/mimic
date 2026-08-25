@@ -1,5 +1,24 @@
 # Changelog for Mimic
 
+## Unreleased
+
+- Fix wildcard filters never following interface address changes: the netlink
+  delta list was only applied after a failed recv (inverted condition)
+- Fix userspace packet-buffer leak when the kernel swaps a handshake buffer out
+  while a store event is in flight
+- Fix initial SYN sequence number being 0 in a rare race between the egress
+  fast-path heuristic and a concurrent connection reset
+- Fix `round_to_mul` macro expanding its divisor argument twice, and broken
+  operator precedence in the unused `cmp` macro
+- Fix `_log_b_3` passing three values through a two-element array (latent OOB
+  read into `bpf_snprintf` once a 3-argument log call is added)
+- Egress: fold the header-swap and pseudo-header checksum deltas into a single
+  `bpf_csum_diff` call per packet
+- Userspace: send control packets from a stack buffer instead of allocating
+  per event
+- (breaking for `padding=random` peers) Padding entropy now uses multiply-shift
+  range reduction instead of `% 11`; both peers must run matching versions
+
 ## 0.7.1 (2026-06-04)
 
 - Allow unaligned memory access in BPF, fixing running on riscv64, etc.

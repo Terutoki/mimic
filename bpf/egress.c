@@ -191,7 +191,12 @@ int egress_handler(struct __sk_buff* skb) {
         return TC_ACT_STOLEN;
       }
       conn->state = CONN_SYN_SENT;
-      seq = conn->seq = random;
+      // random may be 0 if the unlocked heuristic above saw ESTABLISHED and a
+      // concurrent reset flipped this conn to IDLE before the lock. Helpers
+      // are forbidden under the lock, so fall back to timestamps already in
+      // the connection (ingress does the same with tstamp).
+      __u32 isn = random ? random : (__u32)tstamp;
+      seq = conn->seq = isn ? isn : (__u32)conn->reset_tstamp;
       conn->seq += 1;
       ack_seq = conn->ack_seq = 0;
       conn->retry_tstamp = conn->reset_tstamp = tstamp;
@@ -260,20 +265,33 @@ int egress_handler(struct __sk_buff* skb) {
   redecl_shot(struct tcphdr, tcp, ip_end, skb);
   log_tcp(false, &conn_key, tcp, payload_len);
 
-  // Chain header-swap and pseudo-header deltas into one seed and patch the
-  // field with a single helper call instead of two. PSEUDO_HDR preserves the
-  // CHECKSUM_PARTIAL field-patching of the old second call; for non-partial
-  // skbs the folded field result is identical (deltas are linear).
-  tcp->check = 0;
-  csum_diff =
-    bpf_csum_diff((__be32*)&old_udp, sizeof(old_udp), (__be32*)tcp, sizeof(*tcp), csum_diff);
-  tcp->check = old_udp_csum;
-
+  // Pack [udphdr|pseudo-hdr] and [tcphdr|pseudo-hdr] into contiguous stack
+  // blobs so the header swap and pseudo-header swap ride ONE bpf_csum_diff
+  // call instead of two; the summed operand set is byte-identical to the old
+  // pair, so the folded delta is bit-for-bit the same (diff reads the stack
+  // copy with check zeroed, not the skb).
   __be16 new_len = htons(udp_len + reserve_len);
-  struct ph_part old_ph = {.protocol = IPPROTO_UDP, .len = old_udp.len};
-  struct ph_part new_ph = {.protocol = IPPROTO_TCP, .len = new_len};
-  csum_diff = bpf_csum_diff((__be32*)&old_ph, sizeof(old_ph), (__be32*)&new_ph, sizeof(new_ph),
-                            csum_diff);
+  struct {
+    struct udphdr udp;
+    struct ph_part ph;
+  } __attribute__((packed)) old_blob = {
+    .udp = old_udp,
+    .ph = {.protocol = IPPROTO_UDP, .len = old_udp.len},
+  };
+  struct {
+    struct tcphdr tcp;
+    struct ph_part ph;
+  } new_blob;
+  new_blob.tcp = *tcp;
+  new_blob.tcp.check = 0;
+  new_blob.ph = (struct ph_part){.protocol = IPPROTO_TCP, .len = new_len};
+  csum_diff =
+    bpf_csum_diff((__be32*)&old_blob, sizeof(old_blob), (__be32*)&new_blob, sizeof(new_blob),
+                  csum_diff);
+  // l4_csum_replace adds the delta onto whatever sits in the field, and the
+  // header rewrite above left stale bytes there: restore the old UDP csum as
+  // the delta base (this also preserves CHECKSUM_PARTIAL semantics).
+  tcp->check = old_udp_csum;
   bpf_l4_csum_replace(skb, csum_off, 0, csum_diff, BPF_F_PSEUDO_HDR);
 
   mimic_change_csum_offset(skb, IPPROTO_TCP);
