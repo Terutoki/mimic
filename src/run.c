@@ -524,7 +524,7 @@ static inline int run_bpf(struct run_args* args, int lock_fd, const char* ifname
 
   // These fds are actually reference of skel, so no need to use _cleanup_fd
   int egress_handler_fd = -1, ingress_handler_fd = -1;
-  int mimic_whitelist_fd = -1, mimic_conns_fd = -1, mimic_rb_fd = -1;
+  int mimic_whitelist_fd = -1, mimic_conns_fd = -1, mimic_rb_fd = -1, mimic_rb_ctrl_fd = -1;
 
   void* wildcards_buf raii(freep) = NULL;
 
@@ -545,6 +545,7 @@ static inline int run_bpf(struct run_args* args, int lock_fd, const char* ifname
 #endif
 
   struct ring_buffer* rb = NULL;
+  struct ring_buffer* rb_ctrl = NULL;
   struct raw_sock_cache sk_cache;
   raw_sock_cache_init(&sk_cache);
 
@@ -612,6 +613,7 @@ static inline int run_bpf(struct run_args* args, int lock_fd, const char* ifname
   struct bpf_map_info map_info = {};
   __u32 prog_len = sizeof(prog_info), map_len = sizeof(map_info);
   _get_map_id(mimic_rb);
+  _get_map_id(mimic_rb_ctrl);
   struct handle_rb_event_ctx ctx = {
     .conns = skel->maps.mimic_conns,
     .ifname = ifname,
@@ -619,6 +621,8 @@ static inline int run_bpf(struct run_args* args, int lock_fd, const char* ifname
   };
   rb = try2_p(ring_buffer__new(mimic_rb_fd, handle_rb_sample, &ctx, NULL),
               _("failed to attach BPF ring buffer '%s': %s"), "mimic_rb", strret);
+  rb_ctrl = try2_p(ring_buffer__new(mimic_rb_ctrl_fd, handle_rb_sample, &ctx, NULL),
+                   _("failed to attach BPF ring buffer '%s': %s"), "mimic_rb_ctrl", strret);
 
   // Save state to lock file
   struct lock_content lock_content = {
@@ -674,6 +678,9 @@ static inline int run_bpf(struct run_args* args, int lock_fd, const char* ifname
   int rb_epfd = ring_buffer__epoll_fd(rb);
   ev = (typeof(ev)){.events = EPOLLIN, .data.fd = rb_epfd};
   try2_e(epoll_ctl(epfd, EPOLL_CTL_ADD, rb_epfd, &ev), _("epoll_ctl error: %s"), strret);
+  int rb_ctrl_epfd = ring_buffer__epoll_fd(rb_ctrl);
+  ev = (typeof(ev)){.events = EPOLLIN, .data.fd = rb_ctrl_epfd};
+  try2_e(epoll_ctl(epfd, EPOLL_CTL_ADD, rb_ctrl_epfd, &ev), _("epoll_ctl error: %s"), strret);
 
   // Signal handler
   sigset_t mask = {};
@@ -709,7 +716,11 @@ static inline int run_bpf(struct run_args* args, int lock_fd, const char* ifname
                       _("error waiting for epoll: %s"), strret);
 
     for (int i = 0; i < nfds; i++) {
-      if (events[i].data.fd == rb_epfd) {
+      if (events[i].data.fd == rb_epfd || events[i].data.fd == rb_ctrl_epfd) {
+        // Control ring is always drained before data: a handshake burst must
+        // not starve SYN/ACK/keepalive/window-probe traffic in a single FIFO.
+        try2(ring_buffer__poll(rb_ctrl, 0), _("failed to poll ring buffer '%s': %s"),
+             "mimic_rb_ctrl", strret);
         try2(ring_buffer__poll(rb, 0), _("failed to poll ring buffer '%s': %s"), "mimic_rb",
              strret);
 
@@ -764,6 +775,7 @@ cleanup:
     if (xdp_attached) bpf_xdp_detach(ifindex, args->xdp_mode, NULL);
   }
   raw_sock_flush(&sk_cache);
+  if (rb_ctrl) ring_buffer__free(rb_ctrl);
   if (rb) ring_buffer__free(rb);
   if (skel) mimic_bpf__destroy(skel);
   return retcode;

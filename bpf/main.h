@@ -36,6 +36,16 @@ extern struct mimic_rb_map {
   __uint(max_entries, 1 << 22);
 } mimic_rb;
 
+// Control-plane ring: SEND_OPTIONS + LOG_EVENT. Kept separate from the data
+// ring so a handshake burst of STORE_PACKET events can never delay SYN/ACK/
+// keepalive/window-probe traffic in the userspace consumer (single FIFO
+// otherwise). STORE_PACKET/CONSUME/FREE stay on mimic_rb: their kernel-side
+// order matters (a CONSUME must not overtake the stores it drains).
+extern struct mimic_rb_ctrl_map {
+  __uint(type, BPF_MAP_TYPE_RINGBUF);
+  __uint(max_entries, 1 << 20);
+} mimic_rb_ctrl;
+
 struct rst_throttle_cell {
   __u64 tstamp;
   __u32 tokens;
@@ -94,7 +104,7 @@ static __always_inline struct conn_tuple gen_conn_key(QUARTET_DEF) {
 static void log_any(enum log_level level, enum log_type type, union log_info* info) {
   if (unlikely(!info)) return;
   if (log_verbosity < (int)level) return;
-  struct rb_item* item = bpf_ringbuf_reserve(&mimic_rb, sizeof(*item), 0);
+  struct rb_item* item = bpf_ringbuf_reserve(&mimic_rb_ctrl, sizeof(*item), 0);
   if (unlikely(!item)) return;
   item->type = RB_ITEM_LOG_EVENT;
   item->log_event = (struct log_event){.level = level, .type = type};
@@ -148,7 +158,7 @@ int rst_rate_ok(__u64 now);
 
 #define _log_rbprintf(_l, _fmt, ...)                                                         \
   ({                                                                                         \
-    struct rb_item* item = bpf_ringbuf_reserve(&mimic_rb, sizeof(*item), 0);                 \
+    struct rb_item* item = bpf_ringbuf_reserve(&mimic_rb_ctrl, sizeof(*item), 0);            \
     if (likely(item)) {                                                                      \
       item->log_event.level = (_l);                                                          \
       item->log_event.type = LOG_MSG;                                                        \
