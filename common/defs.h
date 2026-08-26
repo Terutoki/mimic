@@ -496,7 +496,12 @@ struct rb_item {
       __u16 len;
       bool l4_csum_partial;
     } store_packet;
-    __u64 pktbuf;
+    // CONSUME/FREE events: userspace owns the handshake buffers keyed by
+    // connection, so the ring only carries which connection's buffer to
+    // drain/drop -- never a pointer (single-owner protocol, see src/queue.c).
+    struct {
+      struct conn_tuple conn_key;
+    } pktbuf;
   };
   // additional buffer follows
 };

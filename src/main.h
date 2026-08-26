@@ -108,12 +108,36 @@ struct packet {
 
 struct raw_sock_cache;
 
-struct packet_buf* packet_buf_new(struct conn_tuple* conn);
+// conn-keyed handshake buffer table (userspace owns the buffers; see queue.c)
+#define PKTBUF_BUCKETS 2048
+#define PKTBUF_MAX_CONNS 4096
+#define PKTBUF_GLOBAL_CAP (1 << 29) /* 512 MiB total buffered payload */
+
+struct pktbuf_slot {
+  struct conn_tuple key;
+  struct packet_buf* buf;
+  struct pktbuf_slot* next;
+};
+
+struct pktbuf_table {
+  struct pktbuf_slot* buckets[PKTBUF_BUCKETS];
+  size_t conns, bytes;
+};
+
+struct packet_buf* packet_buf_new(const struct conn_tuple* conn);
 int packet_buf_push(struct packet_buf* buf, const char* data, size_t len, bool l4_csum_partial);
 int packet_buf_consume(struct packet_buf* buf, struct raw_sock_cache* cache,
                        bool* consumed);
 void packet_buf_drain(struct packet_buf* buf);
 void packet_buf_free(struct packet_buf* buf);
+
+struct packet_buf* pktbuf_table_lookup(struct pktbuf_table* table, const struct conn_tuple* key);
+int pktbuf_table_push(struct pktbuf_table* table, const struct conn_tuple* key, const char* data,
+                      size_t len, bool l4_csum_partial);
+int pktbuf_table_consume(struct pktbuf_table* table, const struct conn_tuple* key,
+                         struct raw_sock_cache* cache);
+void pktbuf_table_free(struct pktbuf_table* table, const struct conn_tuple* key);
+void pktbuf_table_destroy(struct pktbuf_table* table);
 
 // Raw sockets receive kernel copies of every matching packet while open, so
 // they are cached only for the duration of one event batch and flushed right

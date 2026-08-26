@@ -185,7 +185,6 @@ int ingress_handler(struct xdp_md* xdp) {
   struct tcp_options opt = {};
   if (tcp->syn) try_xdp(read_tcp_options(xdp, tcp, ip_end, &opt));
 #else
-  __u64 pktbuf = 0;
   __u64 tstamp = 0;  // 0 = not fetched yet; fetched past the whitelist gate below
   struct tcp_options opt = {};
   // Unconditional: for non-SYN packets doff==5 -> len==0 -> immediate return, so
@@ -202,7 +201,6 @@ int ingress_handler(struct xdp_md* xdp) {
   // processing.
 
 #if defined(MIMIC_COMPAT_LINUX_6_1) || defined(MIMIC_COMPAT_LINUX_6_6)
-  __u64 pktbuf = 0;
   __u64 tstamp = bpf_ktime_get_boot_ns();
 
   // Quick path for RST and FIN
@@ -210,11 +208,10 @@ int ingress_handler(struct xdp_md* xdp) {
     if (conn) {
       __u32 cooldown;
       bpf_spin_lock(&conn->lock);
-      swap(pktbuf, conn->pktbuf);
       conn_reset(conn, tstamp);
       cooldown = conn_cooldown_display(conn);
       bpf_spin_unlock(&conn->lock);
-      use_pktbuf(RB_ITEM_FREE_PKTBUF, pktbuf);
+      use_pktbuf(RB_ITEM_FREE_PKTBUF, &conn_key);
       if (tcp->rst) {
         log_destroy(&conn_key, DESTROY_RECV_RST, cooldown);
       } else {
@@ -275,11 +272,10 @@ int ingress_handler(struct xdp_md* xdp) {
     if (conn) {
       __u32 cooldown;
       bpf_spin_lock(&conn->lock);
-      swap(pktbuf, conn->pktbuf);
       conn_reset(conn, tstamp);
       cooldown = conn_cooldown_display(conn);
       bpf_spin_unlock(&conn->lock);
-      use_pktbuf(RB_ITEM_FREE_PKTBUF, pktbuf);
+      use_pktbuf(RB_ITEM_FREE_PKTBUF, &conn_key);
       if (tcp->rst) {
         log_destroy(&conn_key, DESTROY_RECV_RST, cooldown);
       } else {
@@ -351,7 +347,6 @@ int ingress_handler(struct xdp_md* xdp) {
         conn->ack_seq = next_ack_seq(tcp, payload_len);
         conn->cooldown_mul = 0;
         newly_estab = true;
-        swap(pktbuf, conn->pktbuf);
       } else {
         goto fsm_error;
       }
@@ -365,7 +360,6 @@ int ingress_handler(struct xdp_md* xdp) {
           conn->state = CONN_ESTABLISHED;
           conn->cooldown_mul = 0;
           newly_estab = true;
-          swap(pktbuf, conn->pktbuf);
         } else {
           // Simultaneous open a.k.a. 4-way handshake
           conn->state = CONN_SYN_RECV;
@@ -430,7 +424,6 @@ int ingress_handler(struct xdp_md* xdp) {
     br_unlikely default:
     fsm_error:
       flags |= TCP_FLAG_RST;
-      swap(pktbuf, conn->pktbuf);
       conn_reset(conn, tstamp);
       cooldown = conn_cooldown_display(conn);
       seq = conn->seq;
@@ -448,10 +441,10 @@ int ingress_handler(struct xdp_md* xdp) {
   }
   if (unlikely(flags & TCP_FLAG_RST)) {
     log_destroy(&conn_key, DESTROY_INVALID, cooldown);
-    use_pktbuf(RB_ITEM_FREE_PKTBUF, pktbuf);
+    use_pktbuf(RB_ITEM_FREE_PKTBUF, &conn_key);
   } else if (newly_estab) {
     log_conn(LOG_CONN_ESTABLISH, &conn_key);
-    use_pktbuf(RB_ITEM_CONSUME_PKTBUF, pktbuf);
+    use_pktbuf(RB_ITEM_CONSUME_PKTBUF, &conn_key);
   }
   if (will_drop) return XDP_DROP;
 

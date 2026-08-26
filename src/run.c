@@ -231,62 +231,16 @@ static inline int send_ctrl_packet(struct conn_tuple* conn, __be32 flags, __u32 
   return handle_send_ctrl_packet(&s, ifname, cache);
 }
 
-static int store_packet(struct bpf_map* conns, struct conn_tuple* conn_key, const char* data,
+static int store_packet(struct pktbuf_table* pkts, struct conn_tuple* conn_key, const char* data,
                         __u16 len, bool l4_csum_partial) {
-  int retcode;
-  struct connection conn = {};
-  __u64 ours = 0;
-  try2(bpf_map__lookup_elem(conns, conn_key, sizeof(*conn_key), &conn, sizeof(conn), BPF_F_LOCK));
-
-  if (conn.state != CONN_SYN_SENT && conn.state != CONN_SYN_RECV) {
-    log_debug(_("store packet event processed when connection is in %s state"),
-              conn_state_to_str(conn.state));
-    // TODO: send out the packet directly if established
-    return 0;
-  }
-
-  bool created = false;
-  if (!conn.pktbuf) {
-    conn.pktbuf = (__u64)(uintptr_t)try2_p(packet_buf_new(conn_key));
-    ours = conn.pktbuf;
-    created = true;
-  } else {
-    ours = conn.pktbuf;
-  }
-  try2_e(packet_buf_push((struct packet_buf*)(uintptr_t)ours, data, len, l4_csum_partial));
-
-  // Persist only a freshly created buffer, and only if the row still shows a
-  // handshaking state with an empty buffer. Writing back the whole snapshot
-  // unconditionally would republish a swapped-out pointer or regress the
-  // kernel's connection state (both lead to double frees / dead streams).
-  if (created) {
-    struct connection cur = {};
-    try2(bpf_map__lookup_elem(conns, conn_key, sizeof(*conn_key), &cur, sizeof(cur), BPF_F_LOCK));
-    if (cur.pktbuf != 0 || (cur.state != CONN_SYN_SENT && cur.state != CONN_SYN_RECV)) {
-      // kernel swapped the buffer out meanwhile. `ours` was never published,
-      // so no consume/free event will ever reference it: free it here or leak.
-      packet_buf_free((struct packet_buf*)(uintptr_t)ours);
-      return 0;
-    }
-    try2(bpf_map__update_elem(conns, conn_key, sizeof(*conn_key), &conn, sizeof(conn),
-                              BPF_EXIST | BPF_F_LOCK));
-  }
-  return 0;
-cleanup:
-  if (retcode == -ENOENT) {
-    log_conn(LOG_DEBUG, conn_key,
-             _("connection released when attempting to store packet; freeing packet buffer"));
-    retcode = 0;
-  }
-  // Free only a buffer we still own; once the kernel swapped it out
-  // (cur.pktbuf != ours), the ringbuf consume/free event owns it.
-  if (ours && (!conn.pktbuf || conn.pktbuf == ours))
-    packet_buf_free((struct packet_buf*)(uintptr_t)ours);
-  return retcode;
+  // Buffers are userspace-owned and keyed by connection; the kernel never
+  // publishes a pointer, so no map round-trips (or the lookup/re-read/update
+  // race with a kernel-side pktbuf swap) exist on this path.
+  return pktbuf_table_push(pkts, conn_key, data, len, l4_csum_partial);
 }
 
 struct handle_rb_event_ctx {
-  struct bpf_map* conns;
+  struct pktbuf_table* pkts;
   const char* ifname;
   struct raw_sock_cache* sk_cache;
 };
@@ -297,7 +251,6 @@ static int _handle_rb_event(struct handle_rb_event_ctx* ectx, void* data, size_t
   struct conn_tuple* conn = &item->store_packet.conn_key;
   const char* name;
   int ret = 0;
-  bool consumed = false;
   switch (item->type) {
     case RB_ITEM_LOG_EVENT:
       name = N_("logging event");
@@ -312,14 +265,12 @@ static int _handle_rb_event(struct handle_rb_event_ctx* ectx, void* data, size_t
       log_conn(LOG_DEBUG, conn, _("userspace received packet, udp.len=%u, csum_partial=%d"),
                item->store_packet.len, item->store_packet.l4_csum_partial);
       if (item->store_packet.len > data_sz - sizeof(*item)) break;
-      ret = store_packet(ectx->conns, conn, (char*)(item + 1), item->store_packet.len,
+      ret = store_packet(ectx->pkts, conn, (char*)(item + 1), item->store_packet.len,
                          item->store_packet.l4_csum_partial);
       break;
     case RB_ITEM_CONSUME_PKTBUF:
       name = N_("consuming packet buffer");
-      ret = packet_buf_consume((struct packet_buf*)(uintptr_t)item->pktbuf,
-                               ectx->sk_cache, &consumed);
-      if (!consumed) packet_buf_free((struct packet_buf*)(uintptr_t)item->pktbuf);
+      ret = pktbuf_table_consume(ectx->pkts, &item->pktbuf.conn_key, ectx->sk_cache);
       if (ret < 0) {
         log_debug(_("error %s: %s"), gettext(name), strerror(-ret));
         ret = 0;
@@ -327,7 +278,7 @@ static int _handle_rb_event(struct handle_rb_event_ctx* ectx, void* data, size_t
       break;
     case RB_ITEM_FREE_PKTBUF:
       name = N_("freeing packet buffer");
-      packet_buf_free((struct packet_buf*)(uintptr_t)item->pktbuf);
+      pktbuf_table_free(ectx->pkts, &item->pktbuf.conn_key);
       break;
     default:
       name = N_("handling unknown ring buffer item");
@@ -343,26 +294,21 @@ static int handle_rb_sample(void* _ctx, void* data, size_t data_sz) {
 }
 
 // Retry, keepalive, cleanup
-static int do_routine(int conns_fd, const char* ifname, struct raw_sock_cache* sk_cache) {
-  struct _conn_to_free {
-    struct conn_tuple key;
-    struct packet_buf* buf;
-  };
-
+static int do_routine(int conns_fd, const char* ifname, struct raw_sock_cache* sk_cache,
+                      struct pktbuf_table* pkts) {
   int retcode = 0;
 
   struct timespec ts;
   clock_gettime(CLOCK_BOOTTIME, &ts);
   __u64 tstamp = ts.tv_sec * SECOND + ts.tv_nsec;
 
-  struct queue free_queue = {};
   // Batch lookup replaces the per-connection get_next_key + lookup pair: 2N
   // syscalls/sec become ~2N/64, and each bucket spinlock is taken once per
   // batch instead of once per connection (spinning on it here delays the
   // datapath which grabs the same lock). BPF_F_LOCK keeps the locked-read
   // semantics of the old loop; the kernel's hash batch ops honor it since 5.6
   // (out_batch is a 4-byte bucket cursor, a final -ENOENT ends the sweep).
-  enum { DO_ROUTINE_BATCH = 64 };
+  enum { DO_ROUTINE_BATCH = 256 };
   struct conn_tuple keys[DO_ROUTINE_BATCH];
   struct connection conns[DO_ROUTINE_BATCH];
   struct conn_tuple out_batch;
@@ -429,30 +375,22 @@ static int do_routine(int conns_fd, const char* ifname, struct raw_sock_cache* s
 
       if (reset || remove) {
         // Re-read under the bucket lock: our batch snapshot may predate a
-        // kernel-side pktbuf swap (connection established). Clearing/freeing
-        // the fresh value is what keeps buffer ownership single.
+        // kernel-side state change. Handshake buffers are userspace-only, so
+        // ownership is unaffected: drop the local buffer outright -- a fresh
+        // store after this event will start a new buffer, and a concurrent
+        // CONSUME that already fired drains nothing (table lookup misses).
         struct connection cur;
         if (bpf_map_lookup_elem_flags(conns_fd, key, &cur, BPF_F_LOCK) < 0) continue;
-        __u64 pb = cur.pktbuf;
         if (reset) {
-          cur.pktbuf = 0;
           conn_reset(&cur, tstamp);
         } else {
           log_conn(LOG_DEBUG, key, _("connection removed"));
         }
+        pktbuf_table_free(pkts, key);
         if (remove) {
-          struct _conn_to_free* item = malloc(sizeof(*item));
-          if (item) {
-            item->key = *key;
-            item->buf = (struct packet_buf*)(uintptr_t)pb;
-            queue_push(&free_queue, item, free);
-          } else if (pb) {
-            packet_buf_free((struct packet_buf*)(uintptr_t)pb);
-          }
           bpf_map_delete_elem(conns_fd, key);
-        } else if (bpf_map_update_elem(conns_fd, key, &cur, BPF_EXIST | BPF_F_LOCK) == 0) {
-          // update succeeded: we own whatever the row referenced
-          if (pb) packet_buf_free((struct packet_buf*)(uintptr_t)pb);
+        } else {
+          bpf_map_update_elem(conns_fd, key, &cur, BPF_EXIST | BPF_F_LOCK);
         }
         if (reset) {
           log_destroy(LOG_WARN, key, DESTROY_TIMED_OUT, conn_cooldown_display(&cur));
@@ -464,15 +402,7 @@ static int do_routine(int conns_fd, const char* ifname, struct raw_sock_cache* s
     in_batch = &out_batch;
   }
 
-  retcode = 0;
-cleanup:;
-  struct queue_node* node;
-  while ((node = queue_pop(&free_queue))) {
-    struct _conn_to_free* item = node->data;
-    bpf_map_delete_elem(conns_fd, &item->key);
-    packet_buf_free(item->buf);
-    queue_node_free(node);
-  }
+cleanup:
   return retcode;
 }
 
@@ -548,6 +478,7 @@ static inline int run_bpf(struct run_args* args, int lock_fd, const char* ifname
   struct ring_buffer* rb_ctrl = NULL;
   struct raw_sock_cache sk_cache;
   raw_sock_cache_init(&sk_cache);
+  struct pktbuf_table pkts = {};
 
   skel = try2_p(mimic_bpf__open(), _("failed to open BPF program: %s"), strret);
 
@@ -615,7 +546,7 @@ static inline int run_bpf(struct run_args* args, int lock_fd, const char* ifname
   _get_map_id(mimic_rb);
   _get_map_id(mimic_rb_ctrl);
   struct handle_rb_event_ctx ctx = {
-    .conns = skel->maps.mimic_conns,
+    .pkts = &pkts,
     .ifname = ifname,
     .sk_cache = &sk_cache,
   };
@@ -738,7 +669,7 @@ static inline int run_bpf(struct run_args* args, int lock_fd, const char* ifname
       } else if (events[i].data.fd == timer) {
         __u64 expirations;
         read(timer, &expirations, sizeof(expirations));
-        retcode = do_routine(mimic_conns_fd, ifname, &sk_cache);
+        retcode = do_routine(mimic_conns_fd, ifname, &sk_cache, &pkts);
 
       } else if (args->wildcard_count > 0 && events[i].data.fd == rtnl) {
         struct ip_delta_list* ips raii(ip_delta_list_destroy) = NULL;
@@ -763,6 +694,7 @@ static inline int run_bpf(struct run_args* args, int lock_fd, const char* ifname
   retcode = 0;
 cleanup:
   terminate_all_conns(mimic_conns_fd, ifname, &sk_cache);
+  pktbuf_table_destroy(&pkts);
   sigprocmask(SIG_SETMASK, NULL, NULL);
   if (tc_hook_created) tc_hook_cleanup(&tc_hook_egress, &tc_opts_egress);
 #ifdef MIMIC_USE_LIBXDP

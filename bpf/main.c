@@ -106,14 +106,15 @@ cleanup:
   return retcode;
 }
 
-// Need to manually clear conn.pktbuf in eBPF
-int use_pktbuf(enum rb_item_type type, __u64 buf) {
+// Handshake buffers are owned by userspace (conn-keyed table); the kernel only
+// ever posts which connection changed, never a buffer pointer.
+int use_pktbuf(enum rb_item_type type, struct conn_tuple* conn) {
+  if (unlikely(!conn)) return -1;
   if (unlikely(type != RB_ITEM_CONSUME_PKTBUF && type != RB_ITEM_FREE_PKTBUF)) return -1;
-  if (!buf) return 0;
   struct rb_item* item = bpf_ringbuf_reserve(&mimic_rb, sizeof(*item), 0);
   if (unlikely(!item)) return -1;
   item->type = type;
-  item->pktbuf = buf;
+  item->pktbuf.conn_key = *conn;
   bpf_ringbuf_submit(item, 0);
   return 0;
 }

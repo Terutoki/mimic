@@ -110,7 +110,7 @@ void raw_sock_flush(struct raw_sock_cache* cache) {
   }
 }
 
-struct packet_buf* packet_buf_new(struct conn_tuple* conn) {
+struct packet_buf* packet_buf_new(const struct conn_tuple* conn) {
   struct packet_buf* result = calloc(1, sizeof(*result));
   if (!result) return NULL;
   result->conn = *conn;
@@ -213,4 +213,117 @@ void packet_buf_free(struct packet_buf* buf) {
   if (!buf) return;
   packet_buf_drain(buf);
   free(buf);
+}
+
+// ---- conn-keyed handshake buffer table ----
+//
+// Userspace is the single owner of handshake buffers: the kernel only posts
+// STORE/CONSUME/FREE events carrying the connection key, never a pointer.
+// That removes the per-event bpf syscalls of publishing pktbuf into the conns
+// map, and eliminates the lookup/re-read/update TOCTOU that could clobber a
+// concurrently-swapped pktbuf (double-free history). Buffers live here from
+// first datagram until the CONSUME/FREE event or userspace reset.
+
+static inline __u32 pktbuf_hash(const struct conn_tuple* key) {
+  const __u32* p = (const __u32*)key;
+  __u32 h = 2166136261u;
+  for (size_t i = 0; i < sizeof(*key) / sizeof(__u32); i++) {
+    h ^= p[i];
+    h *= 16777619u;
+  }
+  return h & (PKTBUF_BUCKETS - 1);
+}
+
+struct packet_buf* pktbuf_table_lookup(struct pktbuf_table* table, const struct conn_tuple* key) {
+  for (struct pktbuf_slot* slot = table->buckets[pktbuf_hash(key)]; slot; slot = slot->next)
+    if (memcmp(&slot->key, key, sizeof(*key)) == 0) return slot->buf;
+  return NULL;
+}
+
+static struct packet_buf* pktbuf_table_get(struct pktbuf_table* table,
+                                           const struct conn_tuple* key) {
+  struct packet_buf* buf = pktbuf_table_lookup(table, key);
+  if (buf) return buf;
+  if (table->conns >= PKTBUF_MAX_CONNS) return NULL;
+  buf = packet_buf_new(key);
+  if (!buf) return NULL;
+  struct pktbuf_slot* slot = malloc(sizeof(*slot));
+  if (!slot) {
+    free(buf);
+    return NULL;
+  }
+  slot->key = *key;
+  slot->buf = buf;
+  slot->next = table->buckets[pktbuf_hash(key)];
+  table->buckets[pktbuf_hash(key)] = slot;
+  table->conns++;
+  return buf;
+}
+
+struct packet_buf* pktbuf_table_remove(struct pktbuf_table* table, const struct conn_tuple* key) {
+  __u32 idx = pktbuf_hash(key);
+  struct pktbuf_slot** pp = &table->buckets[idx];
+  for (struct pktbuf_slot* slot = *pp; slot; pp = &slot->next, slot = *pp) {
+    if (memcmp(&slot->key, key, sizeof(*key)) == 0) {
+      *pp = slot->next;
+      struct packet_buf* buf = slot->buf;
+      free(slot);
+      table->conns--;
+      return buf;
+    }
+  }
+  return NULL;
+}
+
+int pktbuf_table_push(struct pktbuf_table* table, const struct conn_tuple* key, const char* data,
+                      size_t len, bool l4_csum_partial) {
+  // Over-budget drops are an accounting matter (bounded-buffer semantics),
+  // not errors: return 0 like a buffer-full drop so the ring handler stays
+  // quiet; only real allocation failures surface as errors.
+  if (table->bytes + len > PKTBUF_GLOBAL_CAP) return 0;
+  struct packet_buf* buf = pktbuf_table_get(table, key);
+  if (!buf) return 0;
+  size_t prev = buf->size;
+  int ret = packet_buf_push(buf, data, len, l4_csum_partial);
+  if (ret == 0) table->bytes += buf->size - prev;
+  return ret;
+}
+
+static void pktbuf_table_reclaim(struct pktbuf_table* table, size_t bytes) {
+  table->bytes = bytes >= table->bytes ? table->bytes - bytes : 0;
+}
+
+int pktbuf_table_consume(struct pktbuf_table* table, const struct conn_tuple* key,
+                         struct raw_sock_cache* cache) {
+  struct packet_buf* buf = pktbuf_table_remove(table, key);
+  if (!buf) return 0;
+  size_t bytes = buf->size;
+  bool consumed = false;
+  int ret = packet_buf_consume(buf, cache, &consumed);
+  // consume frees the buffer itself on success; a raw-socket setup failure
+  // leaves it to us (same contract the ring handler used to honor).
+  if (!consumed) packet_buf_free(buf);
+  pktbuf_table_reclaim(table, bytes);
+  return ret;
+}
+
+void pktbuf_table_free(struct pktbuf_table* table, const struct conn_tuple* key) {
+  struct packet_buf* buf = pktbuf_table_remove(table, key);
+  if (!buf) return;
+  pktbuf_table_reclaim(table, buf->size);
+  packet_buf_free(buf);
+}
+
+void pktbuf_table_destroy(struct pktbuf_table* table) {
+  for (__u32 i = 0; i < PKTBUF_BUCKETS; i++) {
+    struct pktbuf_slot* slot = table->buckets[i];
+    while (slot) {
+      struct pktbuf_slot* next = slot->next;
+      packet_buf_free(slot->buf);
+      free(slot);
+      slot = next;
+    }
+    table->buckets[i] = NULL;
+  }
+  table->conns = table->bytes = 0;
 }
