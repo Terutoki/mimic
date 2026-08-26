@@ -258,7 +258,16 @@ int ingress_handler(struct xdp_md* xdp) {
     conn = try_p_drop(bpf_map_lookup_elem(&mimic_conns, &conn_key));
   }
   // Foreign traffic exited above; only known-mimic flows pay the timestamp here.
-  if (!tstamp)
+  // CONN_ESTABLISHED with keepalive fully disabled is the common fast path and
+  // nothing ever reads the activity timestamps for such flows: every stale/
+  // keepalive check in do_routine is gated on the settings, and state changes
+  // always go through conn_reset() or the transition paths below, which take a
+  // fresh value when they need one (SYN can hit fsm_error, RST/FIN the quick
+  // path). Skip the per-packet ktime helper for that case; states that may
+  // consume tstamp keep it.
+  if (!tstamp &&
+      (conn->state != CONN_ESTABLISHED || conn->settings.keepalive.time > 0 ||
+       conn->settings.keepalive.stale > 0 || tcp->syn || tcp->rst || tcp->fin))
     tstamp = bpf_ktime_get_boot_ns();
 
   // Quick path for RST and FIN
@@ -288,19 +297,19 @@ int ingress_handler(struct xdp_md* xdp) {
 
   __be32 flags = 0;
   __u32 seq = 0, ack_seq = 0, cooldown = 0;
-  // Unlocked heuristic read (mirrors the egress fast path): only new
-  // connections and established data segments need entropy. A stale
-  // prediction wastes one helper call at worst; decisions happen under the
-  // lock below, and helpers may not be called while it is held.
-  __u32 random =
-    (conn->state != CONN_ESTABLISHED || payload_len >= 2 || tcp->psh)
-      ? bpf_get_prandom_u32()
-      : 0;
+  // Unlocked heuristic read (mirrors the egress fast path): only new flows
+  // need real entropy (ISN). Established data segments just feed the window
+  // update pick, where a seq-derived deterministic spread is equivalent --
+  // and saves one bpf_get_prandom_u32() per packet (see conn_padding for the
+  // same multiply-shift approach). Decisions still happen under the lock.
+  __u32 random = (conn->state != CONN_ESTABLISHED)
+                   ? bpf_get_prandom_u32()
+                   : ((payload_len >= 2 || tcp->psh) ? conn->seq : 0);
 
   bpf_spin_lock(&conn->lock);
 
   // Incoming traffic == activity
-  conn->retry_tstamp = conn->reset_tstamp = tstamp;
+  if (tstamp) conn->retry_tstamp = conn->reset_tstamp = tstamp;
 
   // Update peer window against newest segment
   if (conn->ack_seq == 0 || (__s32)(ntohl(tcp->seq) - conn->ack_seq) >= 0) {
@@ -427,7 +436,7 @@ int ingress_handler(struct xdp_md* xdp) {
       seq = conn->seq;
       break;
   }
-  if (!is_keepalive) conn->stale_tstamp = tstamp;
+  if (!is_keepalive && tstamp) conn->stale_tstamp = tstamp;
 
   __u32 window = conn->window;
   bpf_spin_unlock(&conn->lock);
