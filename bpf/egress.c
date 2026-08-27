@@ -243,16 +243,15 @@ int egress_handler(struct __sk_buff* skb) {
   if (ipv4) {
     __be16 old_len = ipv4->tot_len;
     __be16 new_len = htons(ntohs(old_len) + reserve_len);
+    // Fold (len_delta + proto_delta) into the header checksum arithmetically --
+    // same manual csum update the XDP path uses -- instead of paying a
+    // bpf_l3_csum_replace helper call per packet on this hot path.
     ipv4->tot_len = new_len;
     ipv4->protocol = IPPROTO_TCP;
-
-    int off = l2_end + IPV4_CSUM_OFF;
-    // Fold (len_delta + proto_delta) into a single 16-bit one's complement delta
-    // so IPv4 packets pay one l3_csum_replace call instead of two.
-    __u32 delta = (__u16)~old_len + new_len + htons(IPPROTO_TCP) + (__u16)~htons(IPPROTO_UDP);
-    delta = (delta & 0xffff) + (delta >> 16);
-    delta = (delta & 0xffff) + (delta >> 16);
-    try_shot(bpf_l3_csum_replace(skb, off, 0, (__be16)delta, 2));
+    __u32 ipv4_csum = (__u16)~ntohs(ipv4->check);
+    ipv4_csum += reserve_len;
+    ipv4_csum += IPPROTO_TCP - IPPROTO_UDP;
+    ipv4->check = htons(csum_fold(ipv4_csum));
   } else if (ipv6) {
     ipv6->payload_len = htons(ntohs(ipv6->payload_len) + reserve_len);
     ipv6->nexthdr = IPPROTO_TCP;
