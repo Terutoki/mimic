@@ -11,6 +11,7 @@
 #include <linux/types.h>
 #include <net/if.h>
 #include <netinet/in.h>
+#include <pthread.h>
 #include <signal.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -188,12 +189,21 @@ static int handle_send_ctrl_packet(struct send_options* s, const char* ifname,
     tcp->window = htons(s->window >> WINDOW_SCALE);
 
   if (syn) {
-    // Look up MTU in time for (probably) correctness
-    struct ifreq ifr;
-    strncpy(ifr.ifr_name, ifname, sizeof(ifr.ifr_name));
-    ioctl(sk, SIOCGIFMTU, &ifr);
-    __u16 mss = ip_proto(&s->conn.local) == AF_INET ? max(ifr.ifr_mtu, 576) - 40
-                                                    : max(ifr.ifr_mtu, 1280) - 60;
+    // Look up MTU in time for (probably) correctness; the value is cached per
+    // ifname so SYN retries (and bursts of new connections on the same
+    // interface) don't pay an ioctl each time.
+    if (strcmp(cache->mtu_ifname, ifname) != 0) {
+      struct ifreq ifr;
+      strncpy(ifr.ifr_name, ifname, sizeof(ifr.ifr_name));
+      if (ioctl(sk, SIOCGIFMTU, &ifr) == 0) {
+        cache->mtu = ifr.ifr_mtu;
+        strncpy(cache->mtu_ifname, ifname, sizeof(cache->mtu_ifname));
+        cache->mtu_ifname[sizeof(cache->mtu_ifname) - 1] = '\0';
+      }
+    }
+    __u16 mss = ip_proto(&s->conn.local) == AF_INET
+                  ? max(cache->mtu, 576) - 40
+                  : max(cache->mtu, 1280) - 60;
     __u8 wscale = max_window ? MAX_WINDOW_SCALE : WINDOW_SCALE;
     // Specify TCP options. `1`s at the front of arrays are NOP paddings.
     struct _tlv_be16 {
@@ -303,11 +313,14 @@ static int do_routine(int conns_fd, const char* ifname, struct raw_sock_cache* s
   __u64 tstamp = ts.tv_sec * SECOND + ts.tv_nsec;
 
   // Batch lookup replaces the per-connection get_next_key + lookup pair: 2N
-  // syscalls/sec become ~2N/64, and each bucket spinlock is taken once per
-  // batch instead of once per connection (spinning on it here delays the
-  // datapath which grabs the same lock). BPF_F_LOCK keeps the locked-read
-  // semantics of the old loop; the kernel's hash batch ops honor it since 5.6
-  // (out_batch is a 4-byte bucket cursor, a final -ENOENT ends the sweep).
+  // syscalls/sec become ~2N/64. The batch is taken WITHOUT BPF_F_LOCK: every
+  // locked batch read would touch (and populate) the same cache lines the
+  // per-packet datapath updates under spinlock, ping-ponging them to this CPU
+  // for all entries each second. Decisions below are advisory anyway -- any
+  // state mutation re-reads the entry under BPF_F_LOCK right before writing,
+  // so a stale or torn snapshot can at most defer a retry/keepalive/eviction
+  // for one sweep. BPF_F_LOCK holds the value lock for the whole batch read
+  // otherwise (one acquisition per entry, not per batch).
   enum { DO_ROUTINE_BATCH = 256 };
   struct conn_tuple keys[DO_ROUTINE_BATCH];
   struct connection conns[DO_ROUTINE_BATCH];
@@ -479,6 +492,7 @@ static inline int run_bpf(struct run_args* args, int lock_fd, const char* ifname
   struct raw_sock_cache sk_cache;
   raw_sock_cache_init(&sk_cache);
   struct pktbuf_table pkts = {};
+  if (pthread_mutex_init(&pkts.lock, NULL) != 0) cleanup(-1, "failed to init pktbuf table lock");
 
   skel = try2_p(mimic_bpf__open(), _("failed to open BPF program: %s"), strret);
 
@@ -605,7 +619,6 @@ static inline int run_bpf(struct run_args* args, int lock_fd, const char* ifname
   struct epoll_event events[EPOLL_MAX_EVENTS];
   epfd = try_e(epoll_create1(0), _("failed to create epoll: %s"), strret);
 
-  // BPF log handler / packet sending handler
   int rb_epfd = ring_buffer__epoll_fd(rb);
   ev = (typeof(ev)){.events = EPOLLIN, .data.fd = rb_epfd};
   try2_e(epoll_ctl(epfd, EPOLL_CTL_ADD, rb_epfd, &ev), _("epoll_ctl error: %s"), strret);
@@ -623,6 +636,8 @@ static inline int run_bpf(struct run_args* args, int lock_fd, const char* ifname
 
   // Block default handler for signals of interest
   try2_e(sigprocmask(SIG_SETMASK, &mask, NULL), _("error setting signal mask: %s"), strret);
+
+
 
   // Timer
   timer =
@@ -648,8 +663,6 @@ static inline int run_bpf(struct run_args* args, int lock_fd, const char* ifname
 
     for (int i = 0; i < nfds; i++) {
       if (events[i].data.fd == rb_epfd || events[i].data.fd == rb_ctrl_epfd) {
-        // Control ring is always drained before data: a handshake burst must
-        // not starve SYN/ACK/keepalive/window-probe traffic in a single FIFO.
         try2(ring_buffer__poll(rb_ctrl, 0), _("failed to poll ring buffer '%s': %s"),
              "mimic_rb_ctrl", strret);
         try2(ring_buffer__poll(rb, 0), _("failed to poll ring buffer '%s': %s"), "mimic_rb",
@@ -695,6 +708,7 @@ static inline int run_bpf(struct run_args* args, int lock_fd, const char* ifname
 cleanup:
   terminate_all_conns(mimic_conns_fd, ifname, &sk_cache);
   pktbuf_table_destroy(&pkts);
+  pthread_mutex_destroy(&pkts.lock);
   sigprocmask(SIG_SETMASK, NULL, NULL);
   if (tc_hook_created) tc_hook_cleanup(&tc_hook_egress, &tc_opts_egress);
 #ifdef MIMIC_USE_LIBXDP

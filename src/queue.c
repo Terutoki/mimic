@@ -234,7 +234,10 @@ static inline __u32 pktbuf_hash(const struct conn_tuple* key) {
   return h & (PKTBUF_BUCKETS - 1);
 }
 
-struct packet_buf* pktbuf_table_lookup(struct pktbuf_table* table, const struct conn_tuple* key) {
+// All table operations require the caller to hold table->lock; lookups and
+// mutations (bucket chains + conns/bytes counters) are kept consistent here.
+static struct packet_buf* pktbuf_table_lookup(struct pktbuf_table* table,
+                                              const struct conn_tuple* key) {
   for (struct pktbuf_slot* slot = table->buckets[pktbuf_hash(key)]; slot; slot = slot->next)
     if (memcmp(&slot->key, key, sizeof(*key)) == 0) return slot->buf;
   return NULL;
@@ -281,11 +284,16 @@ int pktbuf_table_push(struct pktbuf_table* table, const struct conn_tuple* key, 
   // not errors: return 0 like a buffer-full drop so the ring handler stays
   // quiet; only real allocation failures surface as errors.
   if (table->bytes + len > PKTBUF_GLOBAL_CAP) return 0;
+  pthread_mutex_lock(&table->lock);
   struct packet_buf* buf = pktbuf_table_get(table, key);
-  if (!buf) return 0;
+  if (!buf) {
+    pthread_mutex_unlock(&table->lock);
+    return 0;
+  }
   size_t prev = buf->size;
   int ret = packet_buf_push(buf, data, len, l4_csum_partial);
   if (ret == 0) table->bytes += buf->size - prev;
+  pthread_mutex_unlock(&table->lock);
   return ret;
 }
 
@@ -295,26 +303,41 @@ static void pktbuf_table_reclaim(struct pktbuf_table* table, size_t bytes) {
 
 int pktbuf_table_consume(struct pktbuf_table* table, const struct conn_tuple* key,
                          struct raw_sock_cache* cache) {
+  // Remove + account under the lock, then send outside it: draining a buffer
+  // can be a multi-ms sendmmsg burst that must not stall STORE_PACKET events
+  // (the worker thread) or do_routine frees (the main thread).
+  pthread_mutex_lock(&table->lock);
   struct packet_buf* buf = pktbuf_table_remove(table, key);
-  if (!buf) return 0;
+  if (!buf) {
+    pthread_mutex_unlock(&table->lock);
+    return 0;
+  }
   size_t bytes = buf->size;
+  pktbuf_table_reclaim(table, bytes);
+  pthread_mutex_unlock(&table->lock);
+
   bool consumed = false;
   int ret = packet_buf_consume(buf, cache, &consumed);
   // consume frees the buffer itself on success; a raw-socket setup failure
   // leaves it to us (same contract the ring handler used to honor).
   if (!consumed) packet_buf_free(buf);
-  pktbuf_table_reclaim(table, bytes);
   return ret;
 }
 
 void pktbuf_table_free(struct pktbuf_table* table, const struct conn_tuple* key) {
+  pthread_mutex_lock(&table->lock);
   struct packet_buf* buf = pktbuf_table_remove(table, key);
-  if (!buf) return;
+  if (!buf) {
+    pthread_mutex_unlock(&table->lock);
+    return;
+  }
   pktbuf_table_reclaim(table, buf->size);
   packet_buf_free(buf);
+  pthread_mutex_unlock(&table->lock);
 }
 
 void pktbuf_table_destroy(struct pktbuf_table* table) {
+  pthread_mutex_lock(&table->lock);
   for (__u32 i = 0; i < PKTBUF_BUCKETS; i++) {
     struct pktbuf_slot* slot = table->buckets[i];
     while (slot) {
@@ -326,4 +349,5 @@ void pktbuf_table_destroy(struct pktbuf_table* table) {
     table->buckets[i] = NULL;
   }
   table->conns = table->bytes = 0;
+  pthread_mutex_unlock(&table->lock);
 }

@@ -3,6 +3,8 @@
 
 #include <bpf/bpf.h>
 #include <linux/types.h>
+#include <net/if.h>
+#include <pthread.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <string.h>
@@ -122,6 +124,11 @@ struct pktbuf_slot {
 struct pktbuf_table {
   struct pktbuf_slot* buckets[PKTBUF_BUCKETS];
   size_t conns, bytes;
+  // STORE/CONSUME/FREE events land on the data-ring worker thread while
+  // do_routine (main thread) frees buffers for reset/evicted connections, so
+  // the table is shared across threads; the granularity is a global table lock
+  // (contention is per-event, far below the datapath rate).
+  pthread_mutex_t lock;
 };
 
 struct packet_buf* packet_buf_new(const struct conn_tuple* conn);
@@ -131,7 +138,6 @@ int packet_buf_consume(struct packet_buf* buf, struct raw_sock_cache* cache,
 void packet_buf_drain(struct packet_buf* buf);
 void packet_buf_free(struct packet_buf* buf);
 
-struct packet_buf* pktbuf_table_lookup(struct pktbuf_table* table, const struct conn_tuple* key);
 int pktbuf_table_push(struct pktbuf_table* table, const struct conn_tuple* key, const char* data,
                       size_t len, bool l4_csum_partial);
 int pktbuf_table_consume(struct pktbuf_table* table, const struct conn_tuple* key,
@@ -153,6 +159,8 @@ struct raw_sock_entry {
 
 struct raw_sock_cache {
   struct raw_sock_entry entries[RAW_SOCK_ENTRIES];
+  char mtu_ifname[IFNAMSIZ];
+  unsigned int mtu;
 };
 
 int raw_sock_get(struct raw_sock_cache* cache, int family, int proto,
@@ -160,6 +168,8 @@ int raw_sock_get(struct raw_sock_cache* cache, int family, int proto,
 void raw_sock_flush(struct raw_sock_cache* cache);
 static inline void raw_sock_cache_init(struct raw_sock_cache* cache) {
   for (int i = 0; i < RAW_SOCK_ENTRIES; i++) cache->entries[i].fd = -1;
+  cache->mtu = 0;
+  cache->mtu_ifname[0] = '\0';
 }
 
 int notify_ready();

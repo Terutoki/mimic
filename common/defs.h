@@ -342,28 +342,32 @@ struct conn_tuple {
   struct in6_addr local, remote;
 };
 
+// Per-flow state is locked on EVERY packet from both directions (egress TX CPU
+// and ingress RX CPU race on the same 4-tuple), so the value's cache behaviour
+// directly shapes datapath throughput. Layout rules:
+//   * per-packet-written fields (lock, seq/ack_seq, window/peer_window, state,
+//     flags) are packed into the first words (one cacheline),
+//   * slow-changing fields (settings, peer mss/wscale) follow them, with the
+//     timestamp block kept off the hot first line where possible.
+// NOTE: no cacheline alignment attribute here - a 64B-aligned value enlarges
+// the BPF stack copies (conn_init) past the verifier's 512B frame budget.
 struct connection {
   struct bpf_spin_lock lock;
   __u32 seq, ack_seq;
   __u32 window, peer_window;
+  enum conn_state {
+    CONN_IDLE,
+    CONN_SYN_SENT,
+    CONN_SYN_RECV,
+    CONN_ESTABLISHED,
+  } state;
+  __u8 cooldown_mul;
+  bool keepalive_sent;
+  bool initiator;
 
-  struct {
-    enum conn_state {
-      CONN_IDLE,
-      CONN_SYN_SENT,
-      CONN_SYN_RECV,
-      CONN_ESTABLISHED,
-    } state;
-    __u8 cooldown_mul;
-    bool keepalive_sent;
-    bool initiator;
-  };
-
-  struct {
-    struct filter_settings settings;
-    __u16 peer_mss;
-    __u8 peer_wscale;
-  };
+  struct filter_settings settings;
+  __u16 peer_mss;
+  __u8 peer_wscale;
 
   __u64 retry_tstamp, reset_tstamp, stale_tstamp;
   __u64 wprobe_tstamp;

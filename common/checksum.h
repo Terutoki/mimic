@@ -23,11 +23,16 @@ static inline __u32 calc_csum(void* data, size_t data_len) {
   // 32-bit words overflows u32 before folding.
   __u64 result = 0;
   const __u8* p = (const __u8*)data;
-  size_t n = data_len & ~(size_t)3;
-  for (size_t i = 0; i < n; i += 4) {
-    __u32 w;
+  size_t n = data_len & ~(size_t)7;
+  for (size_t i = 0; i < n; i += 8) {
+    __u64 w;
     __builtin_memcpy(&w, p + i, sizeof(w));
-    result += __builtin_bswap32(w);
+    w = __builtin_bswap64(w);
+    // Add the two 32-bit limbs separately: a single u64 add of the combined
+    // value lets the low limb's carry poison the high limb (off-by-one on the
+    // checksum), which the fold below has no way to recover.
+    result += (__u32)w;
+    result += w >> 32;
   }
   switch (data_len & 3) {
     case 1: result += (__u32)p[n] << 8; break;

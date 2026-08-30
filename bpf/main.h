@@ -33,7 +33,7 @@ extern struct mimic_whitelist_map {
 
 extern struct mimic_rb_map {
   __uint(type, BPF_MAP_TYPE_RINGBUF);
-  __uint(max_entries, 1 << 22);
+  __uint(max_entries, 1 << 24);
 } mimic_rb;
 
 // Control-plane ring: SEND_OPTIONS + LOG_EVENT. Kept separate from the data
