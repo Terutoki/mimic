@@ -7,11 +7,11 @@ PKG_NAME := mimic
 PKG_VERSION := 0.7.1
 PKG_RELEASE := 5
 
-commit := 487ce87b7d2743465cb37cf8aff8c5ca1c4f7c2f
+commit := f6a2f661c6ad7b39daf0fd0326126bff6c49d42a
 PKG_BUILD_DIR := $(BUILD_DIR)/mimic-$(commit)
 PKG_SOURCE := $(commit).tar.gz
 PKG_SOURCE_URL := https://github.com/Terutoki/mimic/archive/
-PKG_HASH := 7bded65d9c9eb2559319726e4e520892f9f54a6e27e3360435f81dd314e49811
+PKG_HASH := a1d43012d67d7b4b1ec70b52fcfc3aa17553e34fa396c9275027708eb611ff4d
 
 PKG_BUILD_DEPENDS := argp-standalone bpf-headers bpftool/host
 
