@@ -63,12 +63,16 @@ struct tcp_options {
 
 static inline int read_tcp_options(struct xdp_md* xdp, struct tcphdr* tcp, __u32 ip_end,
                                    struct tcp_options* opt) {
+  __u8 opt_buf[80] = {};
   __u32 len = (tcp->doff << 2) - sizeof(*tcp);
-  if (unlikely(len > 80)) return XDP_DROP;
-  if (len == 0) return XDP_PASS;
-  __u8 opt_buf[80];
-  bpf_gt0_hack1(len);
-  try_drop(bpf_xdp_load_bytes(xdp, ip_end + sizeof(*tcp), opt_buf, len));
+  if (unlikely(len > 80))  // TCP options too large
+    return XDP_DROP;
+  else if (len == 0)  // prevent zero-sized read
+    return XDP_PASS;
+  else {
+    bpf_gt0_hack1(len);
+    try_drop(bpf_xdp_load_bytes(xdp, ip_end + sizeof(*tcp), opt_buf, len));
+  }
 
   for (__u32 i = 0; i < len; i++) {
     barrier_var(i);
