@@ -124,10 +124,6 @@ struct pktbuf_slot {
 struct pktbuf_table {
   struct pktbuf_slot* buckets[PKTBUF_BUCKETS];
   size_t conns, bytes;
-  // STORE/CONSUME/FREE events land on the data-ring worker thread while
-  // do_routine (main thread) frees buffers for reset/evicted connections, so
-  // the table is shared across threads; the granularity is a global table lock
-  // (contention is per-event, far below the datapath rate).
   pthread_mutex_t lock;
 };
 
@@ -145,11 +141,7 @@ int pktbuf_table_consume(struct pktbuf_table* table, const struct conn_tuple* ke
 void pktbuf_table_free(struct pktbuf_table* table, const struct conn_tuple* key);
 void pktbuf_table_destroy(struct pktbuf_table* table);
 
-// Raw sockets receive kernel copies of every matching packet while open, so
-// they are cached only for the duration of one event batch and flushed right
-// after it (see raw_sock_flush), keeping the window in which traffic gets
-// mirrored to us as short as the original open-send-close pattern.
-enum { RAW_SOCK_ENTRIES = 4 };  // {AF_INET, AF_INET6} x {IPPROTO_TCP, IPPROTO_UDP}
+enum { RAW_SOCK_ENTRIES = 16 };
 
 struct raw_sock_entry {
   int fd;

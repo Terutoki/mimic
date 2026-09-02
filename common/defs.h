@@ -39,12 +39,7 @@
   })
 
 #define sizeof_array(arr) (sizeof(arr) / sizeof(arr[0]))
-#define round_to_mul(val, mul)                                 \
-  ({                                                           \
-    typeof(val) _val = (val);                                  \
-    typeof(mul) _mul = (mul);                                  \
-    (_val % _mul == 0) ? _val : (_val + (_mul - _val % _mul)); \
-  })
+#define round_to_mul(val, mul) (((val) + (mul)-1) & ~((mul)-1))
 
 #define swap(x, y)   \
   ({                 \
@@ -173,9 +168,7 @@ static inline void freestrp(char** ptr) { freep((void*)ptr); }
 #define MAX_PADDING_LEN 16
 #define PADDING_RANDOM (-127)
 
-// Used for reading packet data in bulk. Larger chunks mean fewer helper calls
-// per buffered packet (see store_packet); bounded by verifier complexity.
-#define SEGMENT_SIZE 512
+#define SEGMENT_SIZE 1024
 
 // Value of window size should be calculated from:
 //   2 * 1000 * speed (MB/s) * latency (ms)
@@ -423,7 +416,7 @@ static __always_inline __be32 conn_max_window(struct connection* conn) {
 
 static __always_inline __u32 time_diff(__u64 unit, __u64 a, __u64 b) {
   if (a <= b) return 0;
-  return (a - b) / unit + !!((a - b) % unit < unit / 2);
+  return (a - b) / unit;
 }
 
 struct send_options {

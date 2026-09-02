@@ -59,16 +59,34 @@ static inline struct packet* _packet_of(struct queue_node* node) {
   return (struct packet*)((char*)node + sizeof(*node));
 }
 
-static int raw_sock_idx(int family, int proto) {
-  return (family == AF_INET6 ? 1 : 0) + (proto == IPPROTO_UDP ? 2 : 0);
+static int raw_sock_idx(int family, int proto, const struct in6_addr* local) {
+  __u32 h = 2166136261u;
+  h ^= (__u32)family;
+  h *= 16777619u;
+  h ^= (__u32)proto;
+  h *= 16777619u;
+  for (size_t i = 0; i < sizeof(local->s6_addr32) / sizeof(__u32); i++) {
+    h ^= local->s6_addr32[i];
+    h *= 16777619u;
+  }
+  return h & (RAW_SOCK_ENTRIES - 1);
 }
 
 int raw_sock_get(struct raw_sock_cache* cache, int family, int proto,
                  const struct in6_addr* local) {
-  struct raw_sock_entry* entry = &cache->entries[raw_sock_idx(family, proto)];
-  if (entry->fd >= 0 && entry->bound && memcmp(&entry->addr, local, sizeof(*local)) == 0)
-    return entry->fd;
-
+  int idx = raw_sock_idx(family, proto, local);
+  for (int probe = 0; probe < RAW_SOCK_ENTRIES; probe++) {
+    int i = (idx + probe) & (RAW_SOCK_ENTRIES - 1);
+    struct raw_sock_entry* entry = &cache->entries[i];
+    if (entry->fd >= 0 && entry->bound && memcmp(&entry->addr, local, sizeof(*local)) == 0)
+      return entry->fd;
+    if (entry->fd < 0 || !entry->bound) {
+      idx = i;
+      break;
+    }
+    if (probe == RAW_SOCK_ENTRIES - 1) idx = (idx + 1) & (RAW_SOCK_ENTRIES - 1);
+  }
+  struct raw_sock_entry* entry = &cache->entries[idx];
   if (entry->fd >= 0) close(entry->fd);
   entry->bound = false;
 
@@ -159,7 +177,7 @@ int packet_buf_consume(struct packet_buf* buf, struct raw_sock_cache* cache, boo
 
   int ret = 0;
   size_t total = 0, dropped = 0;
-  enum { PKT_SEND_BATCH = 64 };
+  enum { PKT_SEND_BATCH = 128 };
   struct mmsghdr msgs[PKT_SEND_BATCH];
   struct iovec iovs[PKT_SEND_BATCH];
   struct queue_node* nodes[PKT_SEND_BATCH];
@@ -280,9 +298,6 @@ struct packet_buf* pktbuf_table_remove(struct pktbuf_table* table, const struct 
 
 int pktbuf_table_push(struct pktbuf_table* table, const struct conn_tuple* key, const char* data,
                       size_t len, bool l4_csum_partial) {
-  // Over-budget drops are an accounting matter (bounded-buffer semantics),
-  // not errors: return 0 like a buffer-full drop so the ring handler stays
-  // quiet; only real allocation failures surface as errors.
   if (table->bytes + len > PKTBUF_GLOBAL_CAP) return 0;
   pthread_mutex_lock(&table->lock);
   struct packet_buf* buf = pktbuf_table_get(table, key);
@@ -303,9 +318,6 @@ static void pktbuf_table_reclaim(struct pktbuf_table* table, size_t bytes) {
 
 int pktbuf_table_consume(struct pktbuf_table* table, const struct conn_tuple* key,
                          struct raw_sock_cache* cache) {
-  // Remove + account under the lock, then send outside it: draining a buffer
-  // can be a multi-ms sendmmsg burst that must not stall STORE_PACKET events
-  // (the worker thread) or do_routine frees (the main thread).
   pthread_mutex_lock(&table->lock);
   struct packet_buf* buf = pktbuf_table_remove(table, key);
   if (!buf) {

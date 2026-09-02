@@ -260,9 +260,8 @@ int egress_handler(struct __sk_buff* skb) {
   __be32 csum_diff = 0;
   try_tc(mangle_data(skb, ip_end + sizeof(*udp), &csum_diff, padding));
   decl_shot(struct tcphdr, tcp, ip_end, skb);
-  // Jitter is bounded well below the advertised window so the wire ack stays
-  // inside middlebox conntrack's valid-ACK range.
-  __u32 ack_jitter = conn->settings.anti_gro ? bpf_get_prandom_u32() & 0xfff : 0;
+  __u32 ack_jitter = 0;
+  if (conn->settings.anti_gro) ack_jitter = ((seq * 2654435761u) >> 20) & 0xfff;
   update_tcp_header(tcp, payload_len, seq, ack_seq, window, ack_jitter);
 
   __u32 csum_off = ip_end + offsetof(struct tcphdr, check);

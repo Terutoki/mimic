@@ -34,15 +34,18 @@ static inline __u32 calc_csum(void* data, size_t data_len) {
     result += (__u32)w;
     result += w >> 32;
   }
-  switch (data_len & 3) {
-    case 1: result += (__u32)p[n] << 8; break;
-    case 2: result += ((__u32)p[n] << 8) | p[n + 1]; break;
-    case 3:
-      result += ((__u32)p[n] << 8) | p[n + 1];
-      result += (__u32)p[n + 2] << 8;
-      break;
-    default: break;
+  size_t rem = data_len - n;
+  if (rem & 4) {
+    __u32 w4;
+    __builtin_memcpy(&w4, p + n, sizeof(w4));
+    result += __builtin_bswap32(w4);
+    n += 4;
   }
+  if (rem & 2) {
+    result += ((__u32)p[n] << 8) | p[n + 1];
+    n += 2;
+  }
+  if (rem & 1) result += (__u32)p[n] << 8;
   __u32 r = (__u32)(result & 0xffffffff) + (__u32)(result >> 32);
   return u32_fold(u32_fold(r));
 }

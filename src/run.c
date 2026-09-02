@@ -189,10 +189,17 @@ static int handle_send_ctrl_packet(struct send_options* s, const char* ifname,
     tcp->window = htons(s->window >> WINDOW_SCALE);
 
   if (syn) {
-    // Look up MTU in time for (probably) correctness; the value is cached per
-    // ifname so SYN retries (and bursts of new connections on the same
-    // interface) don't pay an ioctl each time.
-    if (strcmp(cache->mtu_ifname, ifname) != 0) {
+    if (cache->mtu == 0 && cache->mtu_ifname[0] == '\0') {
+      struct ifreq ifr;
+      strncpy(ifr.ifr_name, ifname, sizeof(ifr.ifr_name));
+      if (ioctl(sk, SIOCGIFMTU, &ifr) == 0) {
+        cache->mtu = ifr.ifr_mtu;
+        strncpy(cache->mtu_ifname, ifname, sizeof(cache->mtu_ifname));
+        cache->mtu_ifname[sizeof(cache->mtu_ifname) - 1] = '\0';
+      } else {
+        cache->mtu = 1500;
+      }
+    } else if (strcmp(cache->mtu_ifname, ifname) != 0) {
       struct ifreq ifr;
       strncpy(ifr.ifr_name, ifname, sizeof(ifr.ifr_name));
       if (ioctl(sk, SIOCGIFMTU, &ifr) == 0) {
@@ -202,8 +209,8 @@ static int handle_send_ctrl_packet(struct send_options* s, const char* ifname,
       }
     }
     __u16 mss = ip_proto(&s->conn.local) == AF_INET
-                  ? max(cache->mtu, 576) - 40
-                  : max(cache->mtu, 1280) - 60;
+                  ? max(cache->mtu, 576U) - 40U
+                  : max(cache->mtu, 1280U) - 60U;
     __u8 wscale = max_window ? MAX_WINDOW_SCALE : WINDOW_SCALE;
     // Specify TCP options. `1`s at the front of arrays are NOP paddings.
     struct _tlv_be16 {
@@ -321,12 +328,12 @@ static int do_routine(int conns_fd, const char* ifname, struct raw_sock_cache* s
   // so a stale or torn snapshot can at most defer a retry/keepalive/eviction
   // for one sweep. BPF_F_LOCK holds the value lock for the whole batch read
   // otherwise (one acquisition per entry, not per batch).
-  enum { DO_ROUTINE_BATCH = 256 };
+  enum { DO_ROUTINE_BATCH = 512 };
   struct conn_tuple keys[DO_ROUTINE_BATCH];
   struct connection conns[DO_ROUTINE_BATCH];
   struct conn_tuple out_batch;
   void* in_batch = NULL;
-  struct bpf_map_batch_opts opts = {.sz = sizeof(opts), .elem_flags = BPF_F_LOCK};
+  struct bpf_map_batch_opts opts = {.sz = sizeof(opts), .elem_flags = 0};
 
   for (;;) {
     __u32 count = DO_ROUTINE_BATCH;
@@ -491,6 +498,20 @@ static inline int run_bpf(struct run_args* args, int lock_fd, const char* ifname
   struct ring_buffer* rb_ctrl = NULL;
   struct raw_sock_cache sk_cache;
   raw_sock_cache_init(&sk_cache);
+  {
+    int _mtu_sock = socket(AF_INET, SOCK_DGRAM, 0);
+    if (_mtu_sock >= 0) {
+      struct ifreq _ifr;
+      strncpy(_ifr.ifr_name, ifname, sizeof(_ifr.ifr_name));
+      if (ioctl(_mtu_sock, SIOCGIFMTU, &_ifr) == 0) {
+        sk_cache.mtu = _ifr.ifr_mtu;
+        strncpy(sk_cache.mtu_ifname, ifname, sizeof(sk_cache.mtu_ifname));
+        sk_cache.mtu_ifname[sizeof(sk_cache.mtu_ifname) - 1] = '\0';
+      }
+      close(_mtu_sock);
+    }
+    if (sk_cache.mtu == 0) sk_cache.mtu = 1500;
+  }
   struct pktbuf_table pkts = {};
   if (pthread_mutex_init(&pkts.lock, NULL) != 0) cleanup(-1, "failed to init pktbuf table lock");
 
@@ -681,7 +702,9 @@ static inline int run_bpf(struct run_args* args, int lock_fd, const char* ifname
 
       } else if (events[i].data.fd == timer) {
         __u64 expirations;
-        read(timer, &expirations, sizeof(expirations));
+        ssize_t _r = read(timer, &expirations, sizeof(expirations));
+        if (_r < 0 && errno != EAGAIN) log_warn(_("failed to read timerfd: %s"), strerror(errno));
+        (void)_r;
         retcode = do_routine(mimic_conns_fd, ifname, &sk_cache, &pkts);
 
       } else if (args->wildcard_count > 0 && events[i].data.fd == rtnl) {
