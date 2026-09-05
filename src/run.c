@@ -328,7 +328,7 @@ static int do_routine(int conns_fd, const char* ifname, struct raw_sock_cache* s
   // so a stale or torn snapshot can at most defer a retry/keepalive/eviction
   // for one sweep. BPF_F_LOCK holds the value lock for the whole batch read
   // otherwise (one acquisition per entry, not per batch).
-  enum { DO_ROUTINE_BATCH = 512 };
+  enum { DO_ROUTINE_BATCH = 1024 };
   struct conn_tuple keys[DO_ROUTINE_BATCH];
   struct connection conns[DO_ROUTINE_BATCH];
   struct conn_tuple out_batch;

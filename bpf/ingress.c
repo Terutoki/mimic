@@ -166,12 +166,12 @@ int ingress_handler(struct xdp_md* xdp) {
 
   if (ip_proto != IPPROTO_TCP || ipv6_frag) return XDP_PASS;
   decl_pass(struct tcphdr, tcp, ip_end, xdp);
+  if (tcp->syn) {
+    __u16 win = ntohs(tcp->window);
+    if (win != 0x3400 && win != 0xffff) return XDP_PASS;
+  }
 
 #if defined(MIMIC_COMPAT_LINUX_6_1) || defined(MIMIC_COMPAT_LINUX_6_6)
-  // Linux 6.1/6.6 verifier struggles to unroll the option-parsing loop below; it
-  // exhausts the 1M insn budget when the loop is entered from divergent states.
-  // Keep the whitelist lookup unconditional at the top (single provably-non-null
-  // settings state crossing the loop) — the geometry proven to load on 6.1/6.6.
   struct filter_settings* settings = matches_whitelist(QUARTET_TCP);
   if (!settings) return XDP_PASS;
 #endif
@@ -187,12 +187,7 @@ int ingress_handler(struct xdp_md* xdp) {
 #else
   __u64 tstamp = 0;  // 0 = not fetched yet; fetched past the whitelist gate below
   struct tcp_options opt = {};
-  // Unconditional: for non-SYN packets doff==5 -> len==0 -> immediate return, so
-  // the call is free. Keeping it straight-line here stops clang from hoisting the
-  // whitelist/conn-init block (below) above this option-parsing loop, which would
-  // give the loop two divergent entry states and blow the verifier's 1M insn
-  // budget on old kernels (6.1).
-  try_xdp(read_tcp_options(xdp, tcp, ip_end, &opt));
+  if (tcp->syn) try_xdp(read_tcp_options(xdp, tcp, ip_end, &opt));
 #endif
 
   // XXX: handle matched packets regardless of their checksum. To verify checksum in XDP, loops have

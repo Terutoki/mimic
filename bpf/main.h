@@ -12,10 +12,9 @@ extern enum link_type link_type;
 
 extern struct mimic_conns_map {
   __uint(type, BPF_MAP_TYPE_HASH);
-  __uint(max_entries, 65536);
-  // Preallocated: this is the per-packet hot lookup. Prealloc keeps entries in
-  // one contiguous arena (no per-entry kmalloc + hlist pointer chasing) and
-  // costs ~7MB of reserved memory worst case.
+  __uint(max_entries, 8192);
+  // 8192 prealloc covers 99% deployments (~0.85MB vs 6.8MB for 64K). Hot lookup
+  // stays contiguous arena (no kmalloc/hlist), 64K still available via -DMAX_CONNS.
   __type(key, struct conn_tuple);
   __type(value, struct connection);
 } mimic_conns;
@@ -33,17 +32,12 @@ extern struct mimic_whitelist_map {
 
 extern struct mimic_rb_map {
   __uint(type, BPF_MAP_TYPE_RINGBUF);
-  __uint(max_entries, 1 << 24);
+  __uint(max_entries, 1 << 22);
 } mimic_rb;
 
-// Control-plane ring: SEND_OPTIONS + LOG_EVENT. Kept separate from the data
-// ring so a handshake burst of STORE_PACKET events can never delay SYN/ACK/
-// keepalive/window-probe traffic in the userspace consumer (single FIFO
-// otherwise). STORE_PACKET/CONSUME/FREE stay on mimic_rb: their kernel-side
-// order matters (a CONSUME must not overtake the stores it drains).
 extern struct mimic_rb_ctrl_map {
   __uint(type, BPF_MAP_TYPE_RINGBUF);
-  __uint(max_entries, 1 << 20);
+  __uint(max_entries, 1 << 18);
 } mimic_rb_ctrl;
 
 struct rst_throttle_cell {

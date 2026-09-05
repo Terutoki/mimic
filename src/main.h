@@ -141,7 +141,7 @@ int pktbuf_table_consume(struct pktbuf_table* table, const struct conn_tuple* ke
 void pktbuf_table_free(struct pktbuf_table* table, const struct conn_tuple* key);
 void pktbuf_table_destroy(struct pktbuf_table* table);
 
-enum { RAW_SOCK_ENTRIES = 16 };
+enum { RAW_SOCK_ENTRIES = 32 };
 
 struct raw_sock_entry {
   int fd;

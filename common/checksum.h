@@ -17,20 +17,29 @@ static inline __u32 u32_fold(__u32 num) { return (num & 0xffff) + (num >> 16); }
 static inline __u16 csum_fold(__u32 csum) { return ~u32_fold(u32_fold(csum)); }
 
 static inline __u32 calc_csum(void* data, size_t data_len) {
-  // Sum 32-bit big-endian words instead of 16-bit: identical checksum residue
-  // class (callers still apply the single final csum_fold), one load+bswap per
-  // step. A 64-bit accumulator is required: MAX_PACKET_SIZE worth of full
-  // 32-bit words overflows u32 before folding.
   __u64 result = 0;
   const __u8* p = (const __u8*)data;
+  size_t n32 = data_len & ~(size_t)31;
+  for (size_t i = 0; i < n32; i += 32) {
+    __u64 w0, w1, w2, w3;
+    __builtin_memcpy(&w0, p + i, 8);
+    __builtin_memcpy(&w1, p + i + 8, 8);
+    __builtin_memcpy(&w2, p + i + 16, 8);
+    __builtin_memcpy(&w3, p + i + 24, 8);
+    w0 = __builtin_bswap64(w0);
+    w1 = __builtin_bswap64(w1);
+    w2 = __builtin_bswap64(w2);
+    w3 = __builtin_bswap64(w3);
+    result += (__u32)w0; result += w0 >> 32;
+    result += (__u32)w1; result += w1 >> 32;
+    result += (__u32)w2; result += w2 >> 32;
+    result += (__u32)w3; result += w3 >> 32;
+  }
   size_t n = data_len & ~(size_t)7;
-  for (size_t i = 0; i < n; i += 8) {
+  for (size_t i = n32; i < n; i += 8) {
     __u64 w;
     __builtin_memcpy(&w, p + i, sizeof(w));
     w = __builtin_bswap64(w);
-    // Add the two 32-bit limbs separately: a single u64 add of the combined
-    // value lets the low limb's carry poison the high limb (off-by-one on the
-    // checksum), which the fold below has no way to recover.
     result += (__u32)w;
     result += w >> 32;
   }

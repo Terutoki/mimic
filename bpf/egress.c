@@ -11,7 +11,7 @@
 
 // Extend socket buffer and move n bytes from front to back.
 static inline int mangle_data(struct __sk_buff* skb, __u16 offset, __be32* csum_diff,
-                              __u32 padding_len) {
+                              __u32 padding_len, __u32 rand_seed) {
   __u16 data_len = skb->len - offset;
   size_t reserve_len = TCP_UDP_HEADER_DIFF + padding_len;
   try_shot(bpf_skb_change_tail(skb, skb->len + reserve_len, 0));
@@ -34,9 +34,8 @@ static inline int mangle_data(struct __sk_buff* skb, __u16 offset, __be32* csum_
     bpf_gt0_hack2(padding_len);
     padding_len = min(padding_len, MAX_PADDING_LEN);
 
-    // One helper call feeds an LCG for the whole padding; padding only needs
-    // to look random on the wire, not be cryptographically unpredictable.
-    __u32 rnd = bpf_get_prandom_u32();
+    __u32 rnd = rand_seed;
+    if (unlikely(!rnd)) rnd = 0x9e3779b9u;
     for (size_t i = 0; i < padding_len / 4 + !!(padding_len % 4); i++) {
       ((__u32*)buf)[i] = rnd;
       rnd = rnd * 1664525u + 1013904223u;
@@ -258,7 +257,8 @@ int egress_handler(struct __sk_buff* skb) {
   }
 
   __be32 csum_diff = 0;
-  try_tc(mangle_data(skb, ip_end + sizeof(*udp), &csum_diff, padding));
+  __u32 pad_seed = seq ^ ack_seq ^ (__u32)payload_len;
+  try_tc(mangle_data(skb, ip_end + sizeof(*udp), &csum_diff, padding, pad_seed));
   decl_shot(struct tcphdr, tcp, ip_end, skb);
   __u32 ack_jitter = 0;
   if (conn->settings.anti_gro) ack_jitter = ((seq * 2654435761u) >> 20) & 0xfff;

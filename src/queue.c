@@ -65,9 +65,16 @@ static int raw_sock_idx(int family, int proto, const struct in6_addr* local) {
   h *= 16777619u;
   h ^= (__u32)proto;
   h *= 16777619u;
-  for (size_t i = 0; i < sizeof(local->s6_addr32) / sizeof(__u32); i++) {
-    h ^= local->s6_addr32[i];
+  if (local->s6_addr32[0] == 0 && local->s6_addr32[1] == 0) {
+    h ^= local->s6_addr32[2];
     h *= 16777619u;
+    h ^= local->s6_addr32[3];
+    h *= 16777619u;
+  } else {
+    for (size_t i = 0; i < sizeof(local->s6_addr32) / sizeof(__u32); i++) {
+      h ^= local->s6_addr32[i];
+      h *= 16777619u;
+    }
   }
   return h & (RAW_SOCK_ENTRIES - 1);
 }
@@ -243,11 +250,21 @@ void packet_buf_free(struct packet_buf* buf) {
 // first datagram until the CONSUME/FREE event or userspace reset.
 
 static inline __u32 pktbuf_hash(const struct conn_tuple* key) {
-  const __u32* p = (const __u32*)key;
   __u32 h = 2166136261u;
-  for (size_t i = 0; i < sizeof(*key) / sizeof(__u32); i++) {
-    h ^= p[i];
-    h *= 16777619u;
+  h ^= ((__u32)key->local_port << 16) | key->remote_port;
+  h *= 16777619u;
+  if (key->local.s6_addr32[0] == 0 && key->local.s6_addr32[1] == 0 &&
+      key->remote.s6_addr32[0] == 0 && key->remote.s6_addr32[1] == 0) {
+    h ^= key->local.s6_addr32[2]; h *= 16777619u;
+    h ^= key->local.s6_addr32[3]; h *= 16777619u;
+    h ^= key->remote.s6_addr32[2]; h *= 16777619u;
+    h ^= key->remote.s6_addr32[3]; h *= 16777619u;
+  } else {
+    const __u32* p = (const __u32*)key;
+    for (size_t i = 0; i < sizeof(*key) / sizeof(__u32); i++) {
+      h ^= p[i];
+      h *= 16777619u;
+    }
   }
   return h & (PKTBUF_BUCKETS - 1);
 }
