@@ -59,22 +59,21 @@ static inline struct packet* _packet_of(struct queue_node* node) {
   return (struct packet*)((char*)node + sizeof(*node));
 }
 
+static inline __u32 fnv1a32_update(__u32 h, __u32 w) {
+  h ^= w;
+  return h * 16777619u;
+}
+
 static int raw_sock_idx(int family, int proto, const struct in6_addr* local) {
   __u32 h = 2166136261u;
-  h ^= (__u32)family;
-  h *= 16777619u;
-  h ^= (__u32)proto;
-  h *= 16777619u;
-  if (local->s6_addr32[0] == 0 && local->s6_addr32[1] == 0) {
-    h ^= local->s6_addr32[2];
-    h *= 16777619u;
-    h ^= local->s6_addr32[3];
-    h *= 16777619u;
+  h = fnv1a32_update(h, (__u32)family);
+  h = fnv1a32_update(h, (__u32)proto);
+  if (ip_proto(local) == AF_INET) {
+    h = fnv1a32_update(h, local->s6_addr32[2]);
+    h = fnv1a32_update(h, local->s6_addr32[3]);
   } else {
-    for (size_t i = 0; i < sizeof(local->s6_addr32) / sizeof(__u32); i++) {
-      h ^= local->s6_addr32[i];
-      h *= 16777619u;
-    }
+    for (size_t i = 0; i < sizeof(local->s6_addr32) / sizeof(__u32); i++)
+      h = fnv1a32_update(h, local->s6_addr32[i]);
   }
   return h & (RAW_SOCK_ENTRIES - 1);
 }
@@ -143,7 +142,11 @@ struct packet_buf* packet_buf_new(const struct conn_tuple* conn) {
 }
 
 int packet_buf_push(struct packet_buf* buf, const char* data, size_t len, bool l4_csum_partial) {
-  if (buf->size + len > MAX_PACKET_BUF_SIZE) return 0;  // drop new packets once buffer is full
+  if (buf->size + len > MAX_PACKET_BUF_SIZE) {
+    log_debug(_("packet_buf_push: per-conn buffer full (%zu+%zu), dropping packet"), buf->size,
+              len);
+    return 0;  // drop new packets once buffer is full (explicitly logged)
+  }
   struct queue_node* node = malloc(sizeof(*node) + sizeof(struct packet) + len);
   if (!node) return -ENOMEM;
   node->next = NULL;
@@ -153,8 +156,18 @@ int packet_buf_push(struct packet_buf* buf, const char* data, size_t len, bool l
   pkt->len = len;
   memcpy(pkt->data, data, len);
   if (l4_csum_partial) {
-    __u32 csum = calc_csum(pkt->data, len);
-    *(__be16*)(pkt->data + offsetof(struct udphdr, check)) = htons(csum_fold(csum));
+    // Zero the checksum field first (it holds a partial/stale value), then
+    // fold in the pseudo-header like the kernel would for CHECKSUM_PARTIAL.
+    *(__be16*)(pkt->data + offsetof(struct udphdr, check)) = 0;
+    __u32 csum = IPPROTO_UDP + (__u32)len;
+    for (int i = 0; i < 8; i++) {
+      csum += ntohs(buf->conn.local.s6_addr16[i]);
+      csum += ntohs(buf->conn.remote.s6_addr16[i]);
+    }
+    csum += calc_csum(pkt->data, len);
+    __u16 folded = csum_fold(csum);
+    *(__be16*)(pkt->data + offsetof(struct udphdr, check)) =
+      htons(folded ? folded : 0xffff);
   }
   if (buf->queue.head) {
     buf->queue.tail->next = node;
@@ -178,7 +191,10 @@ int packet_buf_consume(struct packet_buf* buf, struct raw_sock_cache* cache, boo
   }
 
   int sk = raw_sock_get(cache, ip_proto(&buf->conn.local), IPPROTO_UDP, &buf->conn.local);
-  if (sk < 0) return sk;
+  if (sk < 0) {
+    *consumed = false;
+    return sk;
+  }
   struct sockaddr_storage saddr, daddr;
   conn_tuple_to_addrs(&buf->conn, &saddr, &daddr);
 
@@ -221,7 +237,7 @@ int packet_buf_consume(struct packet_buf* buf, struct raw_sock_cache* cache, boo
     total += n;
     for (__u32 i = 0; i < n; i++) queue_node_free(nodes[i]);
   }
-  if (dropped) log_debug(_("packet_buf_consume: dropped %zu/%zu packet(s)"), dropped, total);
+  if (dropped) log_warn(_("packet_buf_consume: dropped %zu/%zu packet(s)"), dropped, total);
 
   *consumed = true;
   free(buf);
@@ -251,20 +267,15 @@ void packet_buf_free(struct packet_buf* buf) {
 
 static inline __u32 pktbuf_hash(const struct conn_tuple* key) {
   __u32 h = 2166136261u;
-  h ^= ((__u32)key->local_port << 16) | key->remote_port;
-  h *= 16777619u;
-  if (key->local.s6_addr32[0] == 0 && key->local.s6_addr32[1] == 0 &&
-      key->remote.s6_addr32[0] == 0 && key->remote.s6_addr32[1] == 0) {
-    h ^= key->local.s6_addr32[2]; h *= 16777619u;
-    h ^= key->local.s6_addr32[3]; h *= 16777619u;
-    h ^= key->remote.s6_addr32[2]; h *= 16777619u;
-    h ^= key->remote.s6_addr32[3]; h *= 16777619u;
+  h = fnv1a32_update(h, ((__u32)key->local_port << 16) | key->remote_port);
+  if (ip_proto(&key->local) == AF_INET && ip_proto(&key->remote) == AF_INET) {
+    h = fnv1a32_update(h, key->local.s6_addr32[2]);
+    h = fnv1a32_update(h, key->local.s6_addr32[3]);
+    h = fnv1a32_update(h, key->remote.s6_addr32[2]);
+    h = fnv1a32_update(h, key->remote.s6_addr32[3]);
   } else {
     const __u32* p = (const __u32*)key;
-    for (size_t i = 0; i < sizeof(*key) / sizeof(__u32); i++) {
-      h ^= p[i];
-      h *= 16777619u;
-    }
+    for (size_t i = 0; i < sizeof(*key) / sizeof(__u32); i++) h = fnv1a32_update(h, p[i]);
   }
   return h & (PKTBUF_BUCKETS - 1);
 }
@@ -315,7 +326,10 @@ struct packet_buf* pktbuf_table_remove(struct pktbuf_table* table, const struct 
 
 int pktbuf_table_push(struct pktbuf_table* table, const struct conn_tuple* key, const char* data,
                       size_t len, bool l4_csum_partial) {
-  if (table->bytes + len > PKTBUF_GLOBAL_CAP) return 0;
+  if (table->bytes + len > PKTBUF_GLOBAL_CAP) {
+    log_warn(_("pktbuf table global cap reached (%zu+%zu), dropping packet"), table->bytes, len);
+    return 0;
+  }
   pthread_mutex_lock(&table->lock);
   struct packet_buf* buf = pktbuf_table_get(table, key);
   if (!buf) {

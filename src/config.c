@@ -135,22 +135,23 @@ int parse_link_type(const char* str, enum link_type* link) {
   return 0;
 }
 
+static int parse_s16_seq(char* str, __s16* out, size_t n) {
+  int nums[4];
+  if (n > sizeof_array(nums)) return -EINVAL;
+  try(parse_int_seq(str, nums, n));
+  for (size_t i = 0; i < n; i++)
+    if (nums[i] != -1) out[i] = (__s16)nums[i];
+  return 0;
+}
+
 int parse_handshake(char* str, struct filter_handshake* h) {
   if (!str || !h) return -EINVAL;
-  int nums[2];
-  try(parse_int_seq(str, nums, 2));
-  for (int i = 0; i < 2; i++)
-    if (nums[i] != -1) h->array[i] = nums[i];
-  return 0;
+  return parse_s16_seq(str, h->array, 2);
 }
 
 int parse_keepalive(char* str, struct filter_keepalive* k) {
   if (!str || !k) return -EINVAL;
-  int nums[4];
-  try(parse_int_seq(str, nums, 4));
-  for (int i = 0; i < 4; i++)
-    if (nums[i] != -1) k->array[i] = nums[i];
-  return 0;
+  return parse_s16_seq(str, k->array, 4);
 }
 
 int parse_padding(const char* str, __s16* padding) {

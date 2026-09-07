@@ -6,6 +6,7 @@
 #include <bpf/bpf_helpers.h>
 
 #include "common/defs.h"
+#include "common/checksum.h"
 
 extern int log_verbosity;
 extern enum link_type link_type;
@@ -181,6 +182,13 @@ static inline bool ipv6_is_ext(__u8 nexthdr) {
     case IPPROTO_MH: return true;
     default: return false;
   }
+}
+
+static __always_inline void ipv4_adjust_csum(struct iphdr* ipv4, int delta_len, int delta_proto) {
+  __u32 csum = (__u16)~ntohs(ipv4->check);
+  csum += delta_len;
+  csum += delta_proto;
+  ipv4->check = htons(csum_fold(csum));
 }
 
 // HACK: make verifier happy

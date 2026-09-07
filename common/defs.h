@@ -368,7 +368,7 @@ struct connection {
 };
 
 static __always_inline struct connection conn_init(struct filter_settings* settings, __u64 tstamp) {
-  struct connection conn = {.window = 0xffff};
+  struct connection conn = {.window = DEFAULT_WINDOW};
   __builtin_memcpy(&conn.settings, settings, sizeof(*settings));
   conn.retry_tstamp = conn.reset_tstamp = conn.stale_tstamp = tstamp;
   conn.wprobe_tstamp = 0;

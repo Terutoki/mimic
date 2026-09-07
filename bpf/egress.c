@@ -55,6 +55,12 @@ static inline int mangle_data(struct __sk_buff* skb, __u16 offset, __be32* csum_
     try_shot(bpf_skb_store_bytes(skb, offset + TCP_UDP_HEADER_DIFF, buf, padding_len, 0));
   }
 
+  if (copy_len == 0 && padding_len == 0) {
+    __u8 zero[TCP_UDP_HEADER_DIFF] = {};
+    try_shot(bpf_skb_store_bytes(skb, skb->len - TCP_UDP_HEADER_DIFF, zero,
+                                 TCP_UDP_HEADER_DIFF, 0));
+  }
+
   return TC_ACT_OK;
 }
 
@@ -178,12 +184,14 @@ int egress_handler(struct __sk_buff* skb) {
   // atomic sub can never wrap peer_window.
   if (!slow_path) {
     __u32 pw = conn->peer_window;
-    if (likely(conn->state == CONN_ESTABLISHED && pw >= DEFAULT_WINDOW / 2 + 262144)) {
-      __u32 seq_hint = conn->seq, ack_hint = conn->ack_seq;
-      __u32 entropy = seq_hint ^ (anti_gro ? 0 : ack_hint);
-      padding = cfg.padding != PADDING_RANDOM
-                  ? (__u32)cfg.padding
-                  : (__u32)(((__u64)entropy * 11) >> 32);
+    // Random padding derives its length from (seq, ack); concurrent TX CPUs
+    // racing on seq_hint would compute identical padding for distinct wire
+    // seq values, desyncing the ingress strip. Keep random padding on the
+    // locked path where seq allocation is serialized.
+    bool fixed_padding = cfg.padding != PADDING_RANDOM;
+    if (fixed_padding && likely(conn->state == CONN_ESTABLISHED &&
+                                pw >= DEFAULT_WINDOW / 2 + 262144)) {
+      padding = (__u32)cfg.padding;
       seq = __sync_fetch_and_add(&conn->seq, payload_len + padding);
       // BPF atomics only provide ADD: subtracting rides on mod-2^32 wrap.
       __sync_fetch_and_add(&conn->peer_window, 0u - (payload_len + padding));
@@ -227,10 +235,11 @@ int egress_handler(struct __sk_buff* skb) {
         return TC_ACT_STOLEN;
       }
     }
-    conn->peer_window -= payload_len + padding;
-    seq = conn->seq;
+    __sync_fetch_and_add(&conn->peer_window, 0u - (payload_len + padding));
+    // Use atomic add so concurrent lock-free fast-path XADDs on other TX
+    // CPUs are not lost (plain += would race with them).
+    seq = __sync_fetch_and_add(&conn->seq, payload_len + padding);
     ack_seq = conn->ack_seq;
-    conn->seq += payload_len + padding;
   } else {
     if (conn->state == CONN_IDLE) {
       __u32 cooldown = conn_cooldown(conn);
@@ -288,15 +297,9 @@ rewrite:;
   if (ipv4) {
     __be16 old_len = ipv4->tot_len;
     __be16 new_len = htons(ntohs(old_len) + reserve_len);
-    // Fold (len_delta + proto_delta) into the header checksum arithmetically --
-    // same manual csum update the XDP path uses -- instead of paying a
-    // bpf_l3_csum_replace helper call per packet on this hot path.
     ipv4->tot_len = new_len;
     ipv4->protocol = IPPROTO_TCP;
-    __u32 ipv4_csum = (__u16)~ntohs(ipv4->check);
-    ipv4_csum += reserve_len;
-    ipv4_csum += IPPROTO_TCP - IPPROTO_UDP;
-    ipv4->check = htons(csum_fold(ipv4_csum));
+    ipv4_adjust_csum(ipv4, reserve_len, IPPROTO_TCP - IPPROTO_UDP);
   } else if (ipv6) {
     ipv6->payload_len = htons(ntohs(ipv6->payload_len) + reserve_len);
     ipv6->nexthdr = IPPROTO_TCP;

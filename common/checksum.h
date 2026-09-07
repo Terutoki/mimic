@@ -16,6 +16,17 @@
 static inline __u32 u32_fold(__u32 num) { return (num & 0xffff) + (num >> 16); }
 static inline __u16 csum_fold(__u32 csum) { return ~u32_fold(u32_fold(csum)); }
 
+// Checksum sums 16-bit big-endian (network order) words. The 64/32-bit fast
+// paths below byte-swap into host order only on little-endian hosts; on
+// big-endian hosts the memcpy result is already in network order.
+#if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+#define _csum_bswap64(x) __builtin_bswap64(x)
+#define _csum_bswap32(x) __builtin_bswap32(x)
+#else
+#define _csum_bswap64(x) (x)
+#define _csum_bswap32(x) (x)
+#endif
+
 static inline __u32 calc_csum(void* data, size_t data_len) {
   __u64 result = 0;
   const __u8* p = (const __u8*)data;
@@ -26,10 +37,10 @@ static inline __u32 calc_csum(void* data, size_t data_len) {
     __builtin_memcpy(&w1, p + i + 8, 8);
     __builtin_memcpy(&w2, p + i + 16, 8);
     __builtin_memcpy(&w3, p + i + 24, 8);
-    w0 = __builtin_bswap64(w0);
-    w1 = __builtin_bswap64(w1);
-    w2 = __builtin_bswap64(w2);
-    w3 = __builtin_bswap64(w3);
+    w0 = _csum_bswap64(w0);
+    w1 = _csum_bswap64(w1);
+    w2 = _csum_bswap64(w2);
+    w3 = _csum_bswap64(w3);
     result += (__u32)w0; result += w0 >> 32;
     result += (__u32)w1; result += w1 >> 32;
     result += (__u32)w2; result += w2 >> 32;
@@ -39,7 +50,7 @@ static inline __u32 calc_csum(void* data, size_t data_len) {
   for (size_t i = n32; i < n; i += 8) {
     __u64 w;
     __builtin_memcpy(&w, p + i, sizeof(w));
-    w = __builtin_bswap64(w);
+    w = _csum_bswap64(w);
     result += (__u32)w;
     result += w >> 32;
   }
@@ -47,7 +58,7 @@ static inline __u32 calc_csum(void* data, size_t data_len) {
   if (rem & 4) {
     __u32 w4;
     __builtin_memcpy(&w4, p + n, sizeof(w4));
-    result += __builtin_bswap32(w4);
+    result += _csum_bswap32(w4);
     n += 4;
   }
   if (rem & 2) {

@@ -136,6 +136,19 @@ static inline int tc_hook_create_attach(struct bpf_tc_hook* hook, struct bpf_tc_
   return 0;
 }
 
+static inline void ensure_mtu_cached(struct raw_sock_cache* cache, int sk, const char* ifname) {
+  if (cache->mtu != 0 && strcmp(cache->mtu_ifname, ifname) == 0) return;
+  struct ifreq ifr;
+  strncpy(ifr.ifr_name, ifname, sizeof(ifr.ifr_name));
+  if (ioctl(sk, SIOCGIFMTU, &ifr) == 0) {
+    cache->mtu = ifr.ifr_mtu;
+    strncpy(cache->mtu_ifname, ifname, sizeof(cache->mtu_ifname));
+    cache->mtu_ifname[sizeof(cache->mtu_ifname) - 1] = '\0';
+  } else if (cache->mtu == 0) {
+    cache->mtu = 1500;
+  }
+}
+
 // This function is somewhat heavy (see comments below), and is called often. Probably does
 // not really matter since this is not performance-critical either.
 //
@@ -189,25 +202,7 @@ static int handle_send_ctrl_packet(struct send_options* s, const char* ifname,
     tcp->window = htons(s->window >> WINDOW_SCALE);
 
   if (syn) {
-    if (cache->mtu == 0 && cache->mtu_ifname[0] == '\0') {
-      struct ifreq ifr;
-      strncpy(ifr.ifr_name, ifname, sizeof(ifr.ifr_name));
-      if (ioctl(sk, SIOCGIFMTU, &ifr) == 0) {
-        cache->mtu = ifr.ifr_mtu;
-        strncpy(cache->mtu_ifname, ifname, sizeof(cache->mtu_ifname));
-        cache->mtu_ifname[sizeof(cache->mtu_ifname) - 1] = '\0';
-      } else {
-        cache->mtu = 1500;
-      }
-    } else if (strcmp(cache->mtu_ifname, ifname) != 0) {
-      struct ifreq ifr;
-      strncpy(ifr.ifr_name, ifname, sizeof(ifr.ifr_name));
-      if (ioctl(sk, SIOCGIFMTU, &ifr) == 0) {
-        cache->mtu = ifr.ifr_mtu;
-        strncpy(cache->mtu_ifname, ifname, sizeof(cache->mtu_ifname));
-        cache->mtu_ifname[sizeof(cache->mtu_ifname) - 1] = '\0';
-      }
-    }
+    ensure_mtu_cached(cache, sk, ifname);
     __u16 mss = ip_proto(&s->conn.local) == AF_INET
                   ? max(cache->mtu, 576U) - 40U
                   : max(cache->mtu, 1280U) - 60U;
@@ -281,7 +276,11 @@ static int _handle_rb_event(struct handle_rb_event_ctx* ectx, void* data, size_t
       name = N_("storing packet");
       log_conn(LOG_DEBUG, conn, _("userspace received packet, udp.len=%u, csum_partial=%d"),
                item->store_packet.len, item->store_packet.l4_csum_partial);
-      if (item->store_packet.len > data_sz - sizeof(*item)) break;
+      if (item->store_packet.len > data_sz - sizeof(*item)) {
+        log_error(_("dropping oversized store_packet: len=%u sample=%zu"), item->store_packet.len,
+                  data_sz);
+        break;
+      }
       ret = store_packet(ectx->pkts, conn, (char*)(item + 1), item->store_packet.len,
                          item->store_packet.l4_csum_partial);
       break;
@@ -373,11 +372,17 @@ static int do_routine(int conns_fd, const char* ifname, struct raw_sock_cache* s
               reset = true;
             } else if (conn->retry_tstamp >= conn->reset_tstamp) {
               log_conn(LOG_DEBUG, key, _("sending keepalive"));
-              conn->reset_tstamp = tstamp;
-              conn->keepalive_sent = true;
-              send_ctrl_packet(key, TCP_FLAG_ACK | conn_max_window(conn), conn->seq - 1,
-                               conn->ack_seq, conn->window, ifname, sk_cache);
-              bpf_map_update_elem(conns_fd, key, conn, BPF_EXIST | BPF_F_LOCK);
+              struct connection cur;
+              if (bpf_map_lookup_elem_flags(conns_fd, key, &cur, BPF_F_LOCK) == 0) {
+                cur.reset_tstamp = tstamp;
+                cur.keepalive_sent = true;
+                send_ctrl_packet(key, TCP_FLAG_ACK | conn_max_window(&cur), cur.seq - 1,
+                                 cur.ack_seq, cur.window, ifname, sk_cache);
+                bpf_map_update_elem(conns_fd, key, &cur, BPF_EXIST | BPF_F_LOCK);
+              } else {
+                send_ctrl_packet(key, TCP_FLAG_ACK | conn_max_window(conn), conn->seq - 1,
+                                 conn->ack_seq, conn->window, ifname, sk_cache);
+              }
             } else {
               int reset_secs = time_diff(SECOND, tstamp, conn->reset_tstamp);
               if (reset_secs >= conn->settings.keepalive.retry * conn->settings.keepalive.interval) {
@@ -461,7 +466,7 @@ static inline int terminate_all_conns(int mimic_conns_fd, const char* ifname,
     try(bpf_map_lookup_elem_flags(mimic_conns_fd, &key, &conn, BPF_F_LOCK),
         _("failed to get value from map '%s': %s"), "mimic_conns", strret);
     if (conn.state != CONN_IDLE)
-      send_ctrl_packet(&key, TCP_FLAG_RST, 0, 0, 0, ifname, sk_cache);
+      send_ctrl_packet(&key, TCP_FLAG_RST, conn.seq, 0, 0, ifname, sk_cache);
   }
   raw_sock_flush(sk_cache);
   return 0;

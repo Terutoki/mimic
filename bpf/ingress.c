@@ -22,25 +22,35 @@ struct {
 static inline int restore_data(struct xdp_md* xdp, __u16 offset, __u32 buf_len, __be32* csum_diff,
                                __u32 padding_len) {
   size_t reserve_len = TCP_UDP_HEADER_DIFF + padding_len;
-  // Uninitialized on the hot path; the odd fixup reads unwritten buf[0] and
-  // alignment tail bytes, so that rare branch clears first (see below).
+  // Padding and copy stages use separate stack buffers: sharing one buffer
+  // pollutes the odd-length fixup (egress zeroes the whole buffer, ingress
+  // would otherwise read leftover padding bytes). Padding tail bytes past
+  // padding_len are explicitly zeroed to match the egress zero-padded
+  // bpf_csum_diff input (P0-1/P0-2).
+  __u8 pbuf[MAX_PADDING_LEN + 4];
   __u8 buf[MAX_RESERVE_LEN + 4];
   __u16 data_len = buf_len - offset - padding_len;
   __u32 copy_len = min(data_len, reserve_len);
-  if (copy_len > 0 && copy_len <= MAX_RESERVE_LEN && max(data_len, reserve_len) % 2 != 0)
-    __builtin_memset(buf, 0, sizeof(buf));
 
   if (padding_len > 0) {
     bpf_gt0_hack2(padding_len);
     padding_len = min(padding_len, MAX_PADDING_LEN);
 
-    try_drop(bpf_xdp_load_bytes(xdp, offset, buf, padding_len));
-    *csum_diff = bpf_csum_diff((__be32*)buf, round_to_mul(padding_len, 4), NULL, 0, *csum_diff);
-    buf[0] = 0;
+    try_drop(bpf_xdp_load_bytes(xdp, offset, pbuf, padding_len));
+    // Zero the round-up tail so the csum input matches egress (which sends
+    // zero-padded tail bytes on the wire).
+    switch (padding_len % 4) {
+      case 1: pbuf[padding_len + 2] = 0; fallthrough;
+      case 2: pbuf[padding_len + 1] = 0; fallthrough;
+      case 3: pbuf[padding_len + 0] = 0; fallthrough;
+      default: break;
+    }
+    *csum_diff = bpf_csum_diff((__be32*)pbuf, round_to_mul(padding_len, 4), NULL, 0, *csum_diff);
   }
 
   if (likely(copy_len > 0 && copy_len <= MAX_RESERVE_LEN)) {
     bpf_gt0_hack1(copy_len);
+    if (max(data_len, reserve_len) % 2 != 0) __builtin_memset(buf, 0, sizeof(buf));
     try_drop(bpf_xdp_load_bytes(xdp, buf_len - copy_len, buf + 1, copy_len));
     try_drop(bpf_xdp_store_bytes(xdp, offset - TCP_UDP_HEADER_DIFF, buf + 1, copy_len));
 
@@ -315,13 +325,21 @@ int ingress_handler(struct xdp_md* xdp) {
   // RX CPUs race no worse than they do through the spinlock below.
   // Handshake, keepalive, probes, RST/FIN and stale states keep the locked
   // state machine; a concurrently reset flow redirects there on the recheck.
+  if (!tcp->syn && tcp->doff != 5) return XDP_DROP;
   if (!tcp->syn && !tcp->rst && !tcp->fin && payload_len >= 2 &&
       conn->state == CONN_ESTABLISHED) {
     __u32 wire_seq = ntohl(tcp->seq);
     __u32 new_ack = wire_seq + payload_len;
+    // Recheck state immediately before mutating: a concurrent RST/FIN may
+    // have reset the flow after the first check. Without this, a stale fast
+    // path would advance ack_seq on a reset (IDLE) connection.
+    if (unlikely(conn->state != CONN_ESTABLISHED)) goto take_lock;
     if (tstamp) conn->retry_tstamp = conn->reset_tstamp = conn->stale_tstamp = tstamp;
     __u32 old_ack = conn->ack_seq;
-    conn->ack_seq = new_ack;
+    // Only advance forward; retransmits or a concurrently reset (zeroed)
+    // ack_seq must not rewind the stream.
+    if (old_ack == 0 || (__s32)(new_ack - old_ack) >= 0) conn->ack_seq = new_ack;
+    else new_ack = old_ack;
     if (old_ack == 0 || (__s32)(wire_seq - old_ack) >= 0) {
       conn->peer_window = (__u32)ntohs(tcp->window) << conn->peer_wscale;
       conn->wprobe_tstamp = 0;
@@ -341,6 +359,7 @@ int ingress_handler(struct xdp_md* xdp) {
     goto rewrite_ingress;
   }
 
+take_lock:;
   bpf_spin_lock(&conn->lock);
 
   // Incoming traffic == activity
@@ -456,7 +475,7 @@ int ingress_handler(struct xdp_md* xdp) {
           ack_seq = conn->ack_seq;
           conn->window = DEFAULT_WINDOW;
         }
-        conn->window -= payload_len;
+        __sync_fetch_and_add(&conn->window, 0u - payload_len);
       }
       break;
 
@@ -495,11 +514,7 @@ rewrite_ingress:;
     __be16 new_len = htons(ntohs(old_len) - reserve_len);
     ipv4->tot_len = new_len;
     ipv4->protocol = IPPROTO_UDP;
-
-    __u32 ipv4_csum = (__u16)~ntohs(ipv4->check);
-    ipv4_csum -= reserve_len;
-    ipv4_csum += IPPROTO_UDP - IPPROTO_TCP;
-    ipv4->check = htons(csum_fold(ipv4_csum));
+    ipv4_adjust_csum(ipv4, -(int)reserve_len, IPPROTO_UDP - IPPROTO_TCP);
   } else if (ipv6) {
     ipv6->payload_len = htons(ntohs(ipv6->payload_len) - reserve_len);
     ipv6->nexthdr = IPPROTO_UDP;
