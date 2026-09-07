@@ -22,9 +22,13 @@ struct {
 static inline int restore_data(struct xdp_md* xdp, __u16 offset, __u32 buf_len, __be32* csum_diff,
                                __u32 padding_len) {
   size_t reserve_len = TCP_UDP_HEADER_DIFF + padding_len;
-  __u8 buf[MAX_RESERVE_LEN + 4] = {};
+  // Uninitialized on the hot path; the odd fixup reads unwritten buf[0] and
+  // alignment tail bytes, so that rare branch clears first (see below).
+  __u8 buf[MAX_RESERVE_LEN + 4];
   __u16 data_len = buf_len - offset - padding_len;
   __u32 copy_len = min(data_len, reserve_len);
+  if (copy_len > 0 && copy_len <= MAX_RESERVE_LEN && max(data_len, reserve_len) % 2 != 0)
+    __builtin_memset(buf, 0, sizeof(buf));
 
   if (padding_len > 0) {
     bpf_gt0_hack2(padding_len);
@@ -154,7 +158,7 @@ int ingress_handler(struct xdp_md* xdp) {
     ip_proto = ipv6->nexthdr;
     ip_end = l2_end + sizeof(*ipv6);
     struct ipv6_opt_hdr* opt = NULL;
-    for (int i = 0; i < 8; i++) {
+    for (int i = 0; i < 4; i++) {
       if (!ipv6_is_ext(ip_proto)) break;
       if (ip_proto == IPPROTO_FRAGMENT) ipv6_frag = true;
       redecl_drop(struct ipv6_opt_hdr, opt, ip_end, xdp);
@@ -178,7 +182,6 @@ int ingress_handler(struct xdp_md* xdp) {
   struct conn_tuple conn_key = gen_conn_key(QUARTET_TCP);
   __u32 payload_len = ip_payload_len - (tcp->doff << 2);
 
-  log_tcp(true, &conn_key, tcp, payload_len);
   struct connection* conn = bpf_map_lookup_elem(&mimic_conns, &conn_key);
 
 #if defined(MIMIC_COMPAT_LINUX_6_1) || defined(MIMIC_COMPAT_LINUX_6_6)
@@ -286,6 +289,9 @@ int ingress_handler(struct xdp_md* xdp) {
   is_keepalive = newly_estab = false;
   will_send_ctrl_packet = will_drop = true;
 
+  // Only mimic flows reach here (foreign TCP returned above), so tracing one
+  // packet costs nothing for unrelated traffic.
+  log_tcp(true, &conn_key, tcp, payload_len);
   __be32 flags = 0;
   __u32 seq = 0, ack_seq = 0, cooldown = 0;
   // Unlocked heuristic read (mirrors the egress fast path): only new flows
@@ -296,6 +302,44 @@ int ingress_handler(struct xdp_md* xdp) {
   __u32 random = (conn->state != CONN_ESTABLISHED)
                    ? bpf_get_prandom_u32()
                    : ((payload_len >= 2 || tcp->psh) ? conn->seq : 0);
+
+  // Settings never change after conn creation; one copy serves the packet.
+  struct filter_settings icfg = conn->settings;
+  __u32 window = 0;
+
+  // Lock-free data fast lane, mirroring egress: a pure data segment
+  // (payload>=2 rules out the keepalive/probe/empty patterns, which all need
+  // payload<2) on an established flow only advances ack_seq, decays the local
+  // window and refreshes the peer window. The 32-bit stores are single
+  // instructions and the window accounting rides BPF atomics, so concurrent
+  // RX CPUs race no worse than they do through the spinlock below.
+  // Handshake, keepalive, probes, RST/FIN and stale states keep the locked
+  // state machine; a concurrently reset flow redirects there on the recheck.
+  if (!tcp->syn && !tcp->rst && !tcp->fin && payload_len >= 2 &&
+      conn->state == CONN_ESTABLISHED) {
+    __u32 wire_seq = ntohl(tcp->seq);
+    __u32 new_ack = wire_seq + payload_len;
+    if (tstamp) conn->retry_tstamp = conn->reset_tstamp = conn->stale_tstamp = tstamp;
+    __u32 old_ack = conn->ack_seq;
+    conn->ack_seq = new_ack;
+    if (old_ack == 0 || (__s32)(wire_seq - old_ack) >= 0) {
+      conn->peer_window = (__u32)ntohs(tcp->window) << conn->peer_wscale;
+      conn->wprobe_tstamp = 0;
+    }
+    __be32 dflags = icfg.max_window ? TCP_MAX_WINDOW : 0;
+    __u32 w0 = conn->window;
+    __u32 pick = (__u32)(((__u64)random * (__u32)(DEFAULT_WINDOW / 2 - DEFAULT_WINDOW / 4)) >> 32);
+    if (pick + DEFAULT_WINDOW / 4 >= w0) {
+      window = DEFAULT_WINDOW - payload_len;
+      conn->window = window;
+      send_ctrl_packet(&conn_key, dflags | TCP_FLAG_ACK, conn->seq, new_ack, window);
+    } else {
+      __sync_fetch_and_add(&conn->window, 0u - payload_len);
+    }
+    will_send_ctrl_packet = false;
+    will_drop = false;
+    goto rewrite_ingress;
+  }
 
   bpf_spin_lock(&conn->lock);
 
@@ -426,7 +470,7 @@ int ingress_handler(struct xdp_md* xdp) {
   }
   if (!is_keepalive && tstamp) conn->stale_tstamp = tstamp;
 
-  __u32 window = conn->window;
+  window = conn->window;
   bpf_spin_unlock(&conn->lock);
 
   if (flags & TCP_FLAG_SYN && flags & TCP_FLAG_ACK) log_conn(LOG_CONN_ACCEPT, &conn_key);
@@ -443,6 +487,7 @@ int ingress_handler(struct xdp_md* xdp) {
   }
   if (will_drop) return XDP_DROP;
 
+rewrite_ingress:;
   __u32 padding = conn_padding(conn, ntohl(tcp->seq), ntohl(tcp->ack_seq));
   size_t reserve_len = TCP_UDP_HEADER_DIFF + padding;
   if (ipv4) {

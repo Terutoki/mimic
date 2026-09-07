@@ -15,11 +15,15 @@ static inline int mangle_data(struct __sk_buff* skb, __u16 offset, __be32* csum_
   __u16 data_len = skb->len - offset;
   size_t reserve_len = TCP_UDP_HEADER_DIFF + padding_len;
   try_shot(bpf_skb_change_tail(skb, skb->len + reserve_len, 0));
-  __u8 buf[MAX_RESERVE_LEN + 4] = {};
+  // Uninitialized: hot even-length packets skip clearing entirely. The odd
+  // fixup below reads buf[0] and alignment tail bytes the copy never writes,
+  // so that rare branch clears first.
+  __u8 buf[MAX_RESERVE_LEN + 4];
   __u32 copy_len = min(data_len, reserve_len);
 
   if (likely(copy_len > 0 && copy_len <= MAX_RESERVE_LEN)) {
     bpf_gt0_hack1(copy_len);
+    if (max(data_len, reserve_len) % 2 != 0) __builtin_memset(buf, 0, sizeof(buf));
     try_shot(bpf_skb_load_bytes(skb, offset, buf + 1, copy_len));
     try_shot(bpf_skb_store_bytes(skb, skb->len - copy_len, buf + 1, copy_len, 0));
 
@@ -113,7 +117,9 @@ int egress_handler(struct __sk_buff* skb) {
     ip_proto = ipv6->nexthdr;
     ip_end = l2_end + sizeof(*ipv6);
     struct ipv6_opt_hdr* opt = NULL;
-    for (int i = 0; i < 8; i++) {
+    // 4 covers HBH/Routing/Frag/DstOpts in practice; 8 only bloats unrolled
+    // verifier code for no benefit on the hot path.
+    for (int i = 0; i < 4; i++) {
       if (!ipv6_is_ext(ip_proto)) break;
       if (ip_proto == IPPROTO_FRAGMENT) ipv6_frag = true;
       redecl_shot(struct ipv6_opt_hdr, opt, ip_end, skb);
@@ -153,6 +159,44 @@ int egress_handler(struct __sk_buff* skb) {
                             conn->peer_window < DEFAULT_WINDOW / 2);
   __u64 tstamp = slow_path ? bpf_ktime_get_boot_ns() : 0;
   __u32 random = slow_path ? bpf_get_prandom_u32() : 0;
+
+  // Settings never change after conn creation, so one copy up front serves
+  // the whole packet and stays consistent across the unlock boundary.
+  struct filter_settings cfg = conn->settings;
+  __u16 window;
+  __u8 anti_gro = cfg.anti_gro;
+  bool max_window = cfg.max_window;
+
+  // Lock-free fast lane: with a healthy peer window the only shared mutation
+  // is seq/peer_window accounting, which needs atomicity but not mutual
+  // exclusion. __sync_fetch_and_add lowers to a single BPF_STX_XADD (no IRQ
+  // save, no cacheline bounce of a spinlock) while the rare window-probe,
+  // handshake and reset paths keep the existing locked logic below. Stale
+  // unlocked reads are benign: ack_seq/window are cumulative/read-mostly, and
+  // a flipped state just redirects to the locked path. The 256K headroom above
+  // the probe threshold covers racing decrements from other TX CPUs so the
+  // atomic sub can never wrap peer_window.
+  if (!slow_path) {
+    __u32 pw = conn->peer_window;
+    if (likely(conn->state == CONN_ESTABLISHED && pw >= DEFAULT_WINDOW / 2 + 262144)) {
+      __u32 seq_hint = conn->seq, ack_hint = conn->ack_seq;
+      __u32 entropy = seq_hint ^ (anti_gro ? 0 : ack_hint);
+      padding = cfg.padding != PADDING_RANDOM
+                  ? (__u32)cfg.padding
+                  : (__u32)(((__u64)entropy * 11) >> 32);
+      seq = __sync_fetch_and_add(&conn->seq, payload_len + padding);
+      // BPF atomics only provide ADD: subtracting rides on mod-2^32 wrap.
+      __sync_fetch_and_add(&conn->peer_window, 0u - (payload_len + padding));
+      ack_seq = conn->ack_seq;
+      window = max_window ? 0xffff : (conn->window >> WINDOW_SCALE);
+      goto rewrite;
+    }
+    // Heuristic went stale (reset or window dipped): pay the helpers the
+    // fast lane skipped and fall through to the locked path.
+    tstamp = bpf_ktime_get_boot_ns();
+    random = bpf_get_prandom_u32();
+    slow_path = true;
+  }
 
   bpf_spin_lock(&conn->lock);
   if (likely(conn->state == CONN_ESTABLISHED)) {
@@ -208,7 +252,7 @@ int egress_handler(struct __sk_buff* skb) {
       __u32 window = conn->window;
       bpf_spin_unlock(&conn->lock);
       log_conn(LOG_CONN_INIT, &conn_key);
-      send_ctrl_packet(&conn_key, TCP_FLAG_SYN | (conn->settings.max_window ? TCP_MAX_WINDOW : 0),
+      send_ctrl_packet(&conn_key, TCP_FLAG_SYN | (max_window ? TCP_MAX_WINDOW : 0),
                        seq, ack_seq, window);
     } else {
       bpf_spin_unlock(&conn->lock);
@@ -222,6 +266,7 @@ int egress_handler(struct __sk_buff* skb) {
         partial_pre_csum += u32_fold(ntohl(ipv4->saddr));
         partial_pre_csum += u32_fold(ntohl(ipv4->daddr));
       } else if (ipv6) {
+        // Full 128-bit addresses: 8 u16 words each. Must not be trimmed.
         for (int i = 0; i < 8; i++) {
           partial_pre_csum += ntohs(ipv6->saddr.in6_u.u6_addr16[i]);
           partial_pre_csum += ntohs(ipv6->daddr.in6_u.u6_addr16[i]);
@@ -235,9 +280,10 @@ int egress_handler(struct __sk_buff* skb) {
     return store_packet(skb, ip_end, &conn_key, ip_summed);
   }
   // Actual window field in TCP header
-  __u16 window = conn->settings.max_window ? 0xffff : (conn->window >> WINDOW_SCALE);
+  window = max_window ? 0xffff : (conn->window >> WINDOW_SCALE);
   bpf_spin_unlock(&conn->lock);
 
+rewrite:;
   size_t reserve_len = TCP_UDP_HEADER_DIFF + padding;
   if (ipv4) {
     __be16 old_len = ipv4->tot_len;
@@ -261,7 +307,7 @@ int egress_handler(struct __sk_buff* skb) {
   try_tc(mangle_data(skb, ip_end + sizeof(*udp), &csum_diff, padding, pad_seed));
   decl_shot(struct tcphdr, tcp, ip_end, skb);
   __u32 ack_jitter = 0;
-  if (conn->settings.anti_gro) ack_jitter = ((seq * 2654435761u) >> 20) & 0xfff;
+  if (anti_gro) ack_jitter = ((seq * 2654435761u) >> 20) & 0xfff;
   update_tcp_header(tcp, payload_len, seq, ack_seq, window, ack_jitter);
 
   __u32 csum_off = ip_end + offsetof(struct tcphdr, check);
